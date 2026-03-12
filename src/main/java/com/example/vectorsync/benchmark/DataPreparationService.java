@@ -108,6 +108,58 @@ public class DataPreparationService {
     }
 
     public PrepareResult prepareBusinessData(int count, String dataType) {
+        log.info("Starting to prepare {} business data records of type {}", count, dataType);
+        long startTime = System.currentTimeMillis();
+
+        AtomicInteger successCount = new AtomicInteger(0);
+        AtomicInteger failedCount = new AtomicInteger(0);
+        List<String> errors = Collections.synchronizedList(new ArrayList<>());
+
+        ExecutorService executor = Executors.newFixedThreadPool(10);
+        CountDownLatch latch = new CountDownLatch(count);
+
+        for (int i = 0; i < count; i++) {
+            final int index = i;
+            executor.submit(() -> {
+                try {
+                    SyncMessage message = generateBusinessMessage(index, dataType);
+                    String json = objectMapper.writeValueAsString(message);
+                    kafkaTemplate.send(topic, message.getId(), json).get(30, TimeUnit.SECONDS);
+                    successCount.incrementAndGet();
+                } catch (Exception e) {
+                    failedCount.incrementAndGet();
+                    errors.add("Index " + index + ": " + e.getMessage());
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+
+        try {
+            latch.await(10, TimeUnit.MINUTES);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
+        executor.shutdown();
+
+        long duration = System.currentTimeMillis() - startTime;
+
+        PrepareResult result = new PrepareResult();
+        result.setTotalRequested(count);
+        result.setSuccessCount(successCount.get());
+        result.setFailedCount(failedCount.get());
+        result.setDurationMs(duration);
+        result.setTps(count * 1000L / Math.max(duration, 1));
+        result.setErrors(errors);
+
+        log.info("Business data preparation completed. Success: {}, Failed: {}, Duration: {}ms",
+                successCount.get(), failedCount.get(), duration);
+
+        return result;
+    }
+
+    private SyncMessage generateBusinessMessage(int index, String dataType) {
         Map<String, Object> data = new HashMap<>();
         data.put("id", index);
         data.put("index", index);
