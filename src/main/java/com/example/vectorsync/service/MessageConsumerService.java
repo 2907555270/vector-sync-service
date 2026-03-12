@@ -7,13 +7,13 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
-import org.apache.kafka.common.TopicPartition;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 
@@ -30,10 +30,12 @@ public class MessageConsumerService {
     private final LongAdder totalProcessed = new LongAdder();
     private final LongAdder totalSuccess = new LongAdder();
     private final LongAdder totalFailed = new LongAdder();
-    private final LongAdder totalRetried = new LongAdder();
     private final LongAdder totalSkipped = new LongAdder();
+    private final LongAdder totalRetried = new LongAdder();
 
-    private final Map<TopicPartition, Long> pendingOffsets = new ConcurrentHashMap<>();
+    private final Set<String> skipMessageIds = Collections.synchronizedSet(new HashSet<>());
+    private final AtomicInteger consecutiveFailures = new AtomicInteger(0);
+    private final Map<String, Integer> messageRetryCount = new ConcurrentHashMap<>();
 
     @KafkaListener(
             topics = "${sync.kafka.topic}",
@@ -50,54 +52,88 @@ public class MessageConsumerService {
 
         log.info("Received batch of {} messages", records.size());
 
-        boolean allSuccess = true;
+        long batchStartOffset = records.get(0).offset();
+        long batchEndOffset = records.get(records.size() - 1).offset();
+
+        List<ConsumerRecord<String, String>> successRecords = new ArrayList<>();
         List<ConsumerRecord<String, String>> failedRecords = new ArrayList<>();
+        List<ConsumerRecord<String, String>> skipRecords = new ArrayList<>();
 
         for (ConsumerRecord<String, String> record : records) {
-            boolean success = processSingleRecord(record);
-            if (success) {
-                totalSuccess.increment();
-                TopicPartition tp = new TopicPartition(record.topic(), record.partition());
-                pendingOffsets.put(tp, record.offset() + 1);
-            } else {
-                totalFailed.increment();
+            try {
+                SyncMessage message = objectMapper.readValue(record.value(), SyncMessage.class);
+                
+                if (message.getId() == null || message.getId().isEmpty()) {
+                    log.warn("Message missing ID, skipping offset: {}", record.offset());
+                    successRecords.add(record);
+                    totalSkipped.increment();
+                    continue;
+                }
+
+                if (skipMessageIds.contains(message.getId())) {
+                    log.info("Message {} in skip list, acknowledging", message.getId());
+                    successRecords.add(record);
+                    totalSkipped.increment();
+                    continue;
+                }
+
+                int retryCount = messageRetryCount.getOrDefault(message.getId(), 0);
+                if (retryCount >= syncProperties.getRetry().getMaxAttempts()) {
+                    log.warn("Message {} exceeded max retries, will be skipped", message.getId());
+                    skipMessageIds.add(message.getId());
+                    successRecords.add(record);
+                    totalSkipped.increment();
+                    continue;
+                }
+
+                boolean success = processWithRetry(message);
+                
+                if (success) {
+                    successRecords.add(record);
+                    totalSuccess.increment();
+                    messageRetryCount.remove(message.getId());
+                } else {
+                    failedRecords.add(record);
+                    totalFailed.increment();
+                    messageRetryCount.merge(message.getId(), 1, Integer::sum);
+                    consecutiveFailures.incrementAndGet();
+                }
+
+            } catch (JsonProcessingException e) {
+                log.error("Failed to parse message at offset {}: {}", record.offset(), e.getMessage());
+                successRecords.add(record);
+                totalSkipped.increment();
+            } catch (Exception e) {
+                log.error("Failed to process message at offset {}: {}", record.offset(), e.getMessage());
                 failedRecords.add(record);
-                allSuccess = false;
+                totalFailed.increment();
             }
         }
 
         totalProcessed.add(records.size());
 
-        if (allSuccess) {
-            acknowledgment.acknowledge();
-            pendingOffsets.clear();
-            log.debug("All records processed successfully, acknowledged");
+        if (consecutiveFailures.get() >= 10) {
+            log.error("Too many consecutive failures ({}), triggering emergency skip", 
+                    consecutiveFailures.get());
+        }
+
+        if (!failedRecords.isEmpty()) {
+            consecutiveFailures.addAndGet(failedRecords.size());
+            log.warn("Batch {}-{} had {} failed records", batchStartOffset, batchEndOffset, failedRecords.size());
         } else {
-            log.warn("Batch completed with {} failed records, not acknowledging", failedRecords.size());
+            consecutiveFailures.set(0);
+        }
+
+        if (!successRecords.isEmpty()) {
+            acknowledgment.acknowledge();
+            long maxSuccessOffset = successRecords.stream()
+                    .mapToLong(ConsumerRecord::offset)
+                    .max()
+                    .orElse(batchStartOffset);
+            log.info("Acknowledged up to offset {}", maxSuccessOffset);
         }
 
         lastFlushTime.set(System.currentTimeMillis());
-    }
-
-    private boolean processSingleRecord(ConsumerRecord<String, String> record) {
-        try {
-            SyncMessage message = objectMapper.readValue(record.value(), SyncMessage.class);
-            
-            if (message.getId() == null || message.getId().isEmpty()) {
-                log.warn("Message missing ID, skipping offset: {}", record.offset());
-                return true;
-            }
-
-            return processWithRetry(message);
-
-        } catch (JsonProcessingException e) {
-            log.error("Failed to parse message at offset {}: {}", record.offset(), e.getMessage());
-            totalSkipped.increment();
-            return true;
-        } catch (Exception e) {
-            log.error("Failed to process message at offset {}: {}", record.offset(), e.getMessage());
-            return false;
-        }
     }
 
     private boolean processWithRetry(SyncMessage message) {
@@ -130,14 +166,34 @@ public class MessageConsumerService {
         return false;
     }
 
+    public void skipMessage(String messageId) {
+        skipMessageIds.add(messageId);
+        log.info("Added message {} to skip list", messageId);
+    }
+
+    public void clearSkipList() {
+        skipMessageIds.clear();
+        log.info("Cleared skip list");
+    }
+
+    public void resetConsecutiveFailures() {
+        consecutiveFailures.set(0);
+        log.info("Reset consecutive failures counter");
+    }
+
+    public int getSkipListSize() {
+        return skipMessageIds.size();
+    }
+
     public SyncStatus getStatus() {
         return SyncStatus.builder()
                 .totalProcessed(totalProcessed.sum())
                 .totalSuccess(totalSuccess.sum())
                 .totalFailed(totalFailed.sum())
-                .totalRetried(totalRetried.sum())
                 .totalSkipped(totalSkipped.sum())
-                .pendingOffsets(pendingOffsets.size())
+                .totalRetried(totalRetried.sum())
+                .consecutiveFailures(consecutiveFailures.get())
+                .skipListSize(skipMessageIds.size())
                 .lastFlushTime(lastFlushTime.get())
                 .build();
     }
@@ -148,9 +204,10 @@ public class MessageConsumerService {
         private long totalProcessed;
         private long totalSuccess;
         private long totalFailed;
-        private long totalRetried;
         private long totalSkipped;
-        private int pendingOffsets;
+        private long totalRetried;
+        private int consecutiveFailures;
+        private int skipListSize;
         private long lastFlushTime;
     }
 }
