@@ -56,11 +56,13 @@ public class ThroughputTestService {
 
         ThroughputResult result = new ThroughputResult();
         result.setEndTime(testEndTime.get());
+        result.setStartTime(testStartTime.get());
 
+        long initialEsCount = 0;
         try {
             long finalEsCount = elasticsearchService.count();
             result.setFinalEsCount(finalEsCount);
-            result.setActualRecords((int) (finalEsCount - result.getInitialEsCount()));
+            result.setActualRecords((int) (finalEsCount - initialEsCount));
         } catch (Exception e) {
             log.error("Failed to get final ES count", e);
             result.setActualRecords(0);
@@ -102,6 +104,7 @@ public class ThroughputTestService {
         }
 
         result.setStatus(testStatus.get());
+        result.setInitialEsCount(0);
 
         try {
             result.setFinalEsCount(elasticsearchService.count());
