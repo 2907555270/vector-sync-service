@@ -4,15 +4,18 @@ import com.example.vectorsync.config.SyncProperties;
 import com.example.vectorsync.model.SyncMessage;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.springframework.kafka.config.KafkaListenerEndpointRegistry;
+import org.springframework.kafka.listener.MessageListenerContainer;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
@@ -25,19 +28,24 @@ public class MessageConsumerService {
     private final ElasticsearchService elasticsearchService;
     private final SyncProperties syncProperties;
     private final ObjectMapper objectMapper;
+    private final KafkaListenerEndpointRegistry listenerRegistry;
 
+    @Getter
+    private final AtomicBoolean paused = new AtomicBoolean(false);
+    private final AtomicBoolean manuallyPaused = new AtomicBoolean(false);
     private final AtomicLong lastFlushTime = new AtomicLong(System.currentTimeMillis());
     private final LongAdder totalProcessed = new LongAdder();
     private final LongAdder totalSuccess = new LongAdder();
     private final LongAdder totalFailed = new LongAdder();
     private final LongAdder totalSkipped = new LongAdder();
     private final LongAdder totalRetried = new LongAdder();
-
-    private final Set<String> skipMessageIds = Collections.synchronizedSet(new HashSet<>());
     private final AtomicInteger consecutiveFailures = new AtomicInteger(0);
-    private final Map<String, Integer> messageRetryCount = new ConcurrentHashMap<>();
+    private final List<String> failedMessageIds = Collections.synchronizedList(new ArrayList<>());
+
+    public static final String LISTENER_ID = "messageConsumerService";
 
     @KafkaListener(
+            id = LISTENER_ID,
             topics = "${sync.kafka.topic}",
             groupId = "${sync.kafka.consumer-group}",
             containerFactory = "kafkaListenerContainerFactory"
@@ -46,6 +54,11 @@ public class MessageConsumerService {
             List<ConsumerRecord<String, String>> records,
             Acknowledgment acknowledgment
     ) {
+        if (paused.get()) {
+            log.warn("Consumer is paused, not processing records. Records count: {}", records.size());
+            return;
+        }
+
         if (records == null || records.isEmpty()) {
             return;
         }
@@ -57,7 +70,6 @@ public class MessageConsumerService {
 
         List<ConsumerRecord<String, String>> successRecords = new ArrayList<>();
         List<ConsumerRecord<String, String>> failedRecords = new ArrayList<>();
-        List<ConsumerRecord<String, String>> skipRecords = new ArrayList<>();
 
         for (ConsumerRecord<String, String> record : records) {
             try {
@@ -70,33 +82,15 @@ public class MessageConsumerService {
                     continue;
                 }
 
-                if (skipMessageIds.contains(message.getId())) {
-                    log.info("Message {} in skip list, acknowledging", message.getId());
-                    successRecords.add(record);
-                    totalSkipped.increment();
-                    continue;
-                }
-
-                int retryCount = messageRetryCount.getOrDefault(message.getId(), 0);
-                if (retryCount >= syncProperties.getRetry().getMaxAttempts()) {
-                    log.warn("Message {} exceeded max retries, will be skipped", message.getId());
-                    skipMessageIds.add(message.getId());
-                    successRecords.add(record);
-                    totalSkipped.increment();
-                    continue;
-                }
-
                 boolean success = processWithRetry(message);
                 
                 if (success) {
                     successRecords.add(record);
                     totalSuccess.increment();
-                    messageRetryCount.remove(message.getId());
                 } else {
                     failedRecords.add(record);
                     totalFailed.increment();
-                    messageRetryCount.merge(message.getId(), 1, Integer::sum);
-                    consecutiveFailures.incrementAndGet();
+                    failedMessageIds.add(message.getId());
                 }
 
             } catch (JsonProcessingException e) {
@@ -112,25 +106,24 @@ public class MessageConsumerService {
 
         totalProcessed.add(records.size());
 
-        if (consecutiveFailures.get() >= 10) {
-            log.error("Too many consecutive failures ({}), triggering emergency skip", 
-                    consecutiveFailures.get());
-        }
-
         if (!failedRecords.isEmpty()) {
-            consecutiveFailures.addAndGet(failedRecords.size());
-            log.warn("Batch {}-{} had {} failed records", batchStartOffset, batchEndOffset, failedRecords.size());
+            int currentFailures = consecutiveFailures.addAndGet(failedRecords.size());
+            log.warn("Batch {}-{} had {} failed records, consecutive failures: {}", 
+                    batchStartOffset, batchEndOffset, failedRecords.size(), currentFailures);
+
+            if (currentFailures >= syncProperties.getRetry().getMaxConsecutiveFailures()) {
+                log.error("Max consecutive failures reached ({}), pausing consumer", 
+                        syncProperties.getRetry().getMaxConsecutiveFailures());
+                pause();
+            }
         } else {
             consecutiveFailures.set(0);
+            failedMessageIds.clear();
         }
 
         if (!successRecords.isEmpty()) {
             acknowledgment.acknowledge();
-            long maxSuccessOffset = successRecords.stream()
-                    .mapToLong(ConsumerRecord::offset)
-                    .max()
-                    .orElse(batchStartOffset);
-            log.info("Acknowledged up to offset {}", maxSuccessOffset);
+            log.info("Acknowledged {} records", successRecords.size());
         }
 
         lastFlushTime.set(System.currentTimeMillis());
@@ -166,34 +159,65 @@ public class MessageConsumerService {
         return false;
     }
 
-    public void skipMessage(String messageId) {
-        skipMessageIds.add(messageId);
-        log.info("Added message {} to skip list", messageId);
+    public synchronized void pause() {
+        if (!paused.get()) {
+            try {
+                MessageListenerContainer container = listenerRegistry.getListenerContainer(LISTENER_ID);
+                if (container != null) {
+                    container.pause();
+                    paused.set(true);
+                    log.warn("Consumer PAUSED due to consecutive failures. Failed message IDs: {}", 
+                            failedMessageIds);
+                }
+            } catch (Exception e) {
+                log.error("Failed to pause consumer: {}", e.getMessage());
+            }
+        }
     }
 
-    public void clearSkipList() {
-        skipMessageIds.clear();
-        log.info("Cleared skip list");
+    public synchronized void resume() {
+        if (paused.get()) {
+            try {
+                MessageListenerContainer container = listenerRegistry.getListenerContainer(LISTENER_ID);
+                if (container != null) {
+                    container.resume();
+                    paused.set(false);
+                    consecutiveFailures.set(0);
+                    log.info("Consumer RESUMED successfully");
+                }
+            } catch (Exception e) {
+                log.error("Failed to resume consumer: {}", e.getMessage());
+            }
+        }
     }
 
-    public void resetConsecutiveFailures() {
-        consecutiveFailures.set(0);
-        log.info("Reset consecutive failures counter");
+    public void pauseManually() {
+        manuallyPaused.set(true);
+        pause();
+        log.info("Consumer manually paused");
     }
 
-    public int getSkipListSize() {
-        return skipMessageIds.size();
+    public void resumeManually() {
+        manuallyPaused.set(false);
+        resume();
+        log.info("Consumer manually resumed");
+    }
+
+    public boolean isPaused() {
+        return paused.get();
     }
 
     public SyncStatus getStatus() {
         return SyncStatus.builder()
+                .paused(paused.get())
+                .manuallyPaused(manuallyPaused.get())
                 .totalProcessed(totalProcessed.sum())
                 .totalSuccess(totalSuccess.sum())
                 .totalFailed(totalFailed.sum())
                 .totalSkipped(totalSkipped.sum())
                 .totalRetried(totalRetried.sum())
                 .consecutiveFailures(consecutiveFailures.get())
-                .skipListSize(skipMessageIds.size())
+                .failedMessageIds(new ArrayList<>(failedMessageIds))
                 .lastFlushTime(lastFlushTime.get())
                 .build();
     }
@@ -201,13 +225,15 @@ public class MessageConsumerService {
     @lombok.Data
     @lombok.Builder
     public static class SyncStatus {
+        private boolean paused;
+        private boolean manuallyPaused;
         private long totalProcessed;
         private long totalSuccess;
         private long totalFailed;
         private long totalSkipped;
         private long totalRetried;
         private int consecutiveFailures;
-        private int skipListSize;
+        private List<String> failedMessageIds;
         private long lastFlushTime;
     }
 }
