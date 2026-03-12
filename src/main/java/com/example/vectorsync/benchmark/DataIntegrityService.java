@@ -57,45 +57,63 @@ public class DataIntegrityService {
         return result;
     }
 
-    public DuplicateResult checkDuplicates(String index) throws IOException {
+    public DuplicateResult checkDuplicates(String index) {
         DuplicateResult result = new DuplicateResult();
+        result.setDuplicateCount(0);
+        result.setDuplicateIds(new ArrayList<>());
 
-        SearchResponse<Map> response = esClient.search(s -> s
-                        .index(index)
-                        .size(0)
-                        .source(sc -> sc.filter(f -> f.includes("id")))
-                        .aggs(a -> a
-                                .terms("duplicate_ids", t -> t
-                                        .field("id")
-                                        .size(10000)
-                                        .minDocCount(2)
-                                )
-                        ),
-                Map.class
-        );
+        try {
+            SearchResponse<Map> response = esClient.search(s -> s
+                            .index(index)
+                            .size(0)
+                            .source(sc -> sc.filter(f -> f.includes("id")))
+                            .aggs(a -> a
+                                    .terms("duplicate_ids", t -> t
+                                            .field("id")
+                                            .size(10000)
+                                            .minDocCount(2)
+                                    )
+                            ),
+                    Map.class
+            );
 
-        long duplicateCount = 0;
-        if (response.aggregations().containsKey("duplicate_ids")) {
-            duplicateCount = response.aggregations().get("duplicate_ids").sterms().buckets().array().size();
-            result.setDuplicateCount((int) duplicateCount);
+            if (response.aggregations() != null && 
+                response.aggregations().containsKey("duplicate_ids")) {
+                
+                var agg = response.aggregations().get("duplicate_ids");
+                if (agg != null && agg.isSterms()) {
+                    var buckets = agg.sterms().buckets();
+                    if (buckets != null) {
+                        List<String> duplicates = new ArrayList<>();
+                        long duplicateCount = 0;
+                        
+                        for (var bucket : buckets.array()) {
+                            duplicates.add(bucket.key().stringValue() + ": " + bucket.docCount() + " docs");
+                            duplicateCount++;
+                        }
+                        
+                        result.setDuplicateCount((int) duplicateCount);
+                        result.setDuplicateIds(duplicates);
+                    }
+                }
+            }
 
-            List<String> duplicates = new ArrayList<>();
-            response.aggregations().get("duplicate_ids").sterms().buckets().array().forEach(bucket -> {
-                duplicates.add(bucket.key().stringValue() + ": " + bucket.docCount() + " docs");
-            });
-            result.setDuplicateIds(duplicates);
+            log.info("Duplicate check result for index '{}': {} duplicates found", index, result.getDuplicateCount());
+
+        } catch (Exception e) {
+            log.error("Failed to check duplicates for index '{}': {}", index, e.getMessage());
+            result.setDuplicateIds(List.of("Error: " + e.getMessage()));
         }
 
-        log.info("Duplicate check result: {} duplicates found", duplicateCount);
         return result;
     }
 
     public SampleVerifyResult verifySampleData(int sampleSize) {
         SampleVerifyResult result = new SampleVerifyResult();
         result.setTotalCount(sampleSize);
-
-        int verifiedCount = 0;
-        List<String> errors = new ArrayList<>();
+        result.setVerifiedCount(0);
+        result.setPassRate(0.0);
+        result.setErrors(new ArrayList<>());
 
         try {
             SearchResponse<Map> response = esClient.search(s -> s
@@ -105,42 +123,45 @@ public class DataIntegrityService {
                     Map.class
             );
 
+            if (response.hits() == null || response.hits().hits() == null) {
+                log.warn("No hits returned from ES");
+                return result;
+            }
+
             for (var hit : response.hits().hits()) {
                 Map<String, Object> source = hit.source();
                 if (source == null) {
-                    errors.add("Missing source for id: " + hit.id());
+                    result.getErrors().add("Missing source for id: " + hit.id());
                     continue;
                 }
 
                 if (source.get("id") == null) {
-                    errors.add("Missing id field for document: " + hit.id());
+                    result.getErrors().add("Missing id field for document: " + hit.id());
                     continue;
                 }
 
                 if (source.get("type") == null) {
-                    errors.add("Missing type field for document: " + hit.id());
+                    result.getErrors().add("Missing type field for document: " + hit.id());
                     continue;
                 }
 
                 if (source.get("data") == null) {
-                    errors.add("Missing data field for document: " + hit.id());
+                    result.getErrors().add("Missing data field for document: " + hit.id());
                     continue;
                 }
 
-                verifiedCount++;
+                result.setVerifiedCount(result.getVerifiedCount() + 1);
             }
 
-            result.setVerifiedCount(verifiedCount);
-            result.setErrors(errors);
-            result.setPassRate(verifiedCount * 100.0 / sampleSize);
+            result.setPassRate(result.getVerifiedCount() * 100.0 / sampleSize);
 
         } catch (Exception e) {
-            log.error("Sample verification failed", e);
-            result.setErrors(List.of(e.getMessage()));
+            log.error("Sample verification failed: {}", e.getMessage());
+            result.getErrors().add("Error: " + e.getMessage());
         }
 
         log.info("Sample verification: {}/{} passed, pass rate: {}%",
-                verifiedCount, sampleSize, result.getPassRate());
+                result.getVerifiedCount(), sampleSize, result.getPassRate());
 
         return result;
     }
