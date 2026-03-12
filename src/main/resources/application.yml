@@ -1,0 +1,70 @@
+spring:
+  application:
+    name: vector-sync-service
+  elasticsearch:
+    uris: http://192.168.116.5:9200
+  kafka:
+    bootstrap-servers: 192.168.116.5:9092
+    consumer:
+      group-id: vector-sync-group
+      max-poll-records: 500
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      retries: 3
+
+sync:
+  kafka:
+    topic: data-sync-topic
+    consumer-group: vector-sync-group
+  elasticsearch:
+    index: vectors
+    bulk-size: 100
+    flush-interval-seconds: 5
+  batch:
+    size: 100
+    timeout-ms: 3000
+  retry:
+    max-attempts: 3
+    initial-interval-ms: 1000
+    multiplier: 2.0
+    max-interval-ms: 10000
+  vector:
+    provider: local
+    dimension: 384
+    model-name: sentence-transformers/all-MiniLM-L6-v2
+
+server:
+  port: 9001
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+  health:
+    elasticsearch:
+      enabled: true
+    kafka:
+      enabled: true
+
+info:
+  app:
+    name: Vector Sync Service
+    description: Large-scale data sync to Elasticsearch vector database
+    version: 1.0.0
+
+logging:
+  level:
+    root: INFO
+    com.example.vectorsync: DEBUG
+    org.springframework.kafka: INFO
+    org.elasticsearch: INFO
