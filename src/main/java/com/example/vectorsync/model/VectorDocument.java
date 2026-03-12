@@ -31,6 +31,9 @@ public class VectorDocument {
     @JsonProperty("vector")
     private List<Float> vector;
 
+    @JsonProperty("sparse_vector")
+    private Map<String, Object> sparseVector;
+
     @JsonProperty("timestamp")
     private Long timestamp;
 

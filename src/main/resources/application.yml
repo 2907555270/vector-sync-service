@@ -39,6 +39,12 @@ sync:
     dimension: 384
     model-name: sentence-transformers/all-MiniLM-L6-v2
 
+vector:
+  api:
+    base-url: http://localhost:8080
+    timeout: 30000
+    enabled: true
+
 server:
   port: 9001
 
