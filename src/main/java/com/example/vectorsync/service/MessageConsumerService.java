@@ -29,6 +29,7 @@ import java.util.concurrent.atomic.LongAdder;
 public class MessageConsumerService {
 
     private final ElasticsearchService elasticsearchService;
+    private final RetryService retryService;
     private final SyncProperties syncProperties;
     private final ObjectMapper objectMapper;
     private final KafkaListenerEndpointRegistry listenerRegistry;
@@ -39,12 +40,9 @@ public class MessageConsumerService {
     private final LongAdder totalProcessed = new LongAdder();
     private final LongAdder totalSuccess = new LongAdder();
     private final LongAdder totalFailed = new LongAdder();
-    private final LongAdder totalSkipped = new LongAdder();
     private final LongAdder totalRetried = new LongAdder();
+    private final LongAdder totalDlq = new LongAdder();
     private final AtomicInteger consecutiveFailures = new AtomicInteger(0);
-    private final List<String> failedMessageIds = Collections.synchronizedList(new ArrayList<>());
-
-    private final Map<TopicPartition, Long> acknowledgedOffsets = new ConcurrentHashMap<>();
 
     public static final String LISTENER_ID = "messageConsumerService";
 
@@ -70,7 +68,7 @@ public class MessageConsumerService {
         log.info("Received batch of {} messages", records.size());
 
         Map<TopicPartition, OffsetAndMetadata> offsetsToCommit = new HashMap<>();
-        List<ConsumerRecord<String, String>> failedRecords = new ArrayList<>();
+        int batchFailedCount = 0;
 
         for (ConsumerRecord<String, String> record : records) {
             if (paused.get()) {
@@ -84,7 +82,6 @@ public class MessageConsumerService {
                 if (message.getId() == null || message.getId().isEmpty()) {
                     log.warn("Message missing ID, skipping offset: {}", record.offset());
                     addOffsetToCommit(record, offsetsToCommit);
-                    totalSkipped.increment();
                     continue;
                 }
 
@@ -93,34 +90,31 @@ public class MessageConsumerService {
                 if (success) {
                     addOffsetToCommit(record, offsetsToCommit);
                     totalSuccess.increment();
+                    retryService.clearRetryCount(message.getId());
                 } else {
-                    failedRecords.add(record);
-                    totalFailed.increment();
-                    failedMessageIds.add(message.getId());
+                    batchFailedCount++;
+                    handleFailedMessage(message, record.value());
                 }
 
             } catch (JsonProcessingException e) {
                 log.error("Failed to parse message at offset {}: {}", record.offset(), e.getMessage());
                 addOffsetToCommit(record, offsetsToCommit);
-                totalSkipped.increment();
             } catch (Exception e) {
                 log.error("Failed to process message at offset {}: {}", record.offset(), e.getMessage());
-                failedRecords.add(record);
-                totalFailed.increment();
+                batchFailedCount++;
             }
         }
 
-        totalProcessed.add(records.size() - failedRecords.size());
+        totalProcessed.add(records.size() - batchFailedCount);
 
         if (!offsetsToCommit.isEmpty()) {
             acknowledgment.addOffsets(offsetsToCommit);
-            log.info("Acknowledged {} records, failed {} records", offsetsToCommit.size(), failedRecords.size());
+            log.info("Acknowledged {} records", offsetsToCommit.size());
         }
 
-        if (!failedRecords.isEmpty()) {
-            int currentFailures = consecutiveFailures.addAndGet(failedRecords.size());
-            log.warn("Batch had {} failed records, total consecutive failures: {}", 
-                    failedRecords.size(), currentFailures);
+        if (batchFailedCount > 0) {
+            int currentFailures = consecutiveFailures.addAndGet(batchFailedCount);
+            log.warn("Batch had {} failed records, consecutive failures: {}", batchFailedCount, currentFailures);
 
             if (currentFailures >= syncProperties.getRetry().getMaxConsecutiveFailures()) {
                 log.error("Max consecutive failures reached, pausing consumer");
@@ -128,10 +122,28 @@ public class MessageConsumerService {
             }
         } else {
             consecutiveFailures.set(0);
-            failedMessageIds.clear();
         }
 
         lastFlushTime.set(System.currentTimeMillis());
+    }
+
+    private void handleFailedMessage(SyncMessage message, String originalValue) {
+        int currentRetryCount = retryService.getRetryCount(message.getId());
+        
+        if (currentRetryCount >= syncProperties.getRetry().getMaxAttempts()) {
+            log.error("Message {} exceeded max retries ({}) , sending to DLQ", 
+                message.getId(), syncProperties.getRetry().getMaxAttempts());
+            retryService.sendToDlq(message.getId(), originalValue, 
+                "Max retries exceeded", currentRetryCount);
+            totalDlq.increment();
+            retryService.clearRetryCount(message.getId());
+        } else {
+            retryService.incrementRetryCount(message.getId());
+            retryService.sendToRetry(message.getId(), originalValue, currentRetryCount);
+            totalRetried.increment();
+        }
+        
+        totalFailed.increment();
     }
 
     private void addOffsetToCommit(ConsumerRecord<String, String> record, 
@@ -159,7 +171,6 @@ public class MessageConsumerService {
                         attempt, maxRetries, message.getId(), e.getMessage());
                 
                 if (attempt < maxRetries) {
-                    totalRetried.increment();
                     try {
                         long delay = (long) (initialDelay * Math.pow(multiplier, attempt - 1));
                         Thread.sleep(delay);
@@ -182,7 +193,7 @@ public class MessageConsumerService {
                 if (container != null) {
                     container.pause();
                     paused.set(true);
-                    log.error("Consumer PAUSED. Failed message IDs: {}", failedMessageIds);
+                    log.error("Consumer PAUSED due to consecutive failures");
                 }
             } catch (Exception e) {
                 log.error("Failed to pause consumer: {}", e.getMessage());
@@ -198,7 +209,6 @@ public class MessageConsumerService {
                     container.resume();
                     paused.set(false);
                     consecutiveFailures.set(0);
-                    failedMessageIds.clear();
                     log.info("Consumer RESUMED successfully");
                 }
             } catch (Exception e) {
@@ -217,10 +227,11 @@ public class MessageConsumerService {
                 .totalProcessed(totalProcessed.sum())
                 .totalSuccess(totalSuccess.sum())
                 .totalFailed(totalFailed.sum())
-                .totalSkipped(totalSkipped.sum())
                 .totalRetried(totalRetried.sum())
+                .totalDlq(totalDlq.sum())
                 .consecutiveFailures(consecutiveFailures.get())
-                .failedMessageIds(new ArrayList<>(failedMessageIds))
+                .retryTopic(retryService.getRetryTopic())
+                .dlqTopic(retryService.getDlqTopic())
                 .lastFlushTime(lastFlushTime.get())
                 .build();
     }
@@ -232,10 +243,11 @@ public class MessageConsumerService {
         private long totalProcessed;
         private long totalSuccess;
         private long totalFailed;
-        private long totalSkipped;
         private long totalRetried;
+        private long totalDlq;
         private int consecutiveFailures;
-        private List<String> failedMessageIds;
+        private String retryTopic;
+        private String dlqTopic;
         private long lastFlushTime;
     }
 }
