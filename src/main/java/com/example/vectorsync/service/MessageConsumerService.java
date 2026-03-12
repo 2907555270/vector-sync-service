@@ -7,19 +7,14 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.TopicPartition;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.support.Acknowledgment;
-import org.springframework.kafka.support.KafkaHeaders;
-import org.springframework.messaging.handler.annotation.Header;
-import org.springframework.messaging.handler.annotation.Payload;
 import org.springframework.stereotype.Service;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.*;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
-import java.util.stream.Collectors;
 
 @Slf4j
 @Service
@@ -30,12 +25,14 @@ public class MessageConsumerService {
     private final SyncProperties syncProperties;
     private final ObjectMapper objectMapper;
 
-    private final BlockingQueue<List<String>> messageBuffer = new LinkedBlockingQueue<>(100);
-    private final ExecutorService executorService = Executors.newSingleThreadExecutor();
     private final AtomicLong lastFlushTime = new AtomicLong(System.currentTimeMillis());
     private final LongAdder totalProcessed = new LongAdder();
     private final LongAdder totalSuccess = new LongAdder();
     private final LongAdder totalFailed = new LongAdder();
+    private final LongAdder totalRetried = new LongAdder();
+    private final LongAdder totalSkipped = new LongAdder();
+
+    private final Map<TopicPartition, Long> pendingOffsets = new ConcurrentHashMap<>();
 
     @KafkaListener(
             topics = "${sync.kafka.topic}",
@@ -52,122 +49,84 @@ public class MessageConsumerService {
 
         log.info("Received batch of {} messages", records.size());
 
-        try {
-            List<String> rawMessages = records.stream()
-                    .map(ConsumerRecord::value)
-                    .collect(Collectors.toList());
-            
-            List<SyncMessage> syncMessages = parseMessages(rawMessages);
-            
-            if (syncMessages.isEmpty()) {
-                acknowledgment.acknowledge();
-                return;
-            }
+        boolean allSuccess = true;
+        List<ConsumerRecord<String, String>> failedRecords = new ArrayList<>();
 
-            boolean success = processBatch(syncMessages);
-
+        for (ConsumerRecord<String, String> record : records) {
+            boolean success = processSingleRecord(record);
             if (success) {
-                totalProcessed.add(records.size());
-                totalSuccess.add(records.size());
-                acknowledgment.acknowledge();
-                log.debug("Batch processed successfully, acknowledged");
+                totalSuccess.increment();
+                TopicPartition tp = new TopicPartition(record.topic(), record.partition());
+                pendingOffsets.put(tp, record.offset() + 1);
             } else {
-                totalFailed.add(records.size());
-                log.error("Batch processing failed");
+                totalFailed.increment();
+                failedRecords.add(record);
+                allSuccess = false;
             }
+        }
 
-        } catch (Exception e) {
-            totalFailed.add(records.size());
-            log.error("Error processing batch: {}", e.getMessage(), e);
+        totalProcessed.add(records.size());
+
+        if (allSuccess) {
+            acknowledgment.acknowledge();
+            pendingOffsets.clear();
+            log.debug("All records processed successfully, acknowledged");
+        } else {
+            log.warn("Batch completed with {} failed records, not acknowledging", failedRecords.size());
         }
 
         lastFlushTime.set(System.currentTimeMillis());
     }
 
-    private List<SyncMessage> parseMessages(List<String> rawMessages) {
-        List<SyncMessage> syncMessages = new ArrayList<>();
-        
-        for (String rawMessage : rawMessages) {
-            try {
-                SyncMessage message = objectMapper.readValue(rawMessage, SyncMessage.class);
-                
-                if (message.getId() == null || message.getId().isEmpty()) {
-                    log.warn("Message missing ID, skipping: {}", rawMessage);
-                    continue;
-                }
-                
-                syncMessages.add(message);
-            } catch (JsonProcessingException e) {
-                log.error("Failed to parse message: {}", e.getMessage());
-            }
-        }
-        
-        return syncMessages;
-    }
-
-    private boolean processBatch(List<SyncMessage> messages) {
-        int batchSize = syncProperties.getBatch().getSize();
-        
-        if (messages.size() <= batchSize) {
-            return processDirect(messages);
-        }
-        
-        List<List<SyncMessage>> batches = partitionList(messages, batchSize);
-        boolean allSuccess = true;
-        
-        for (List<SyncMessage> batch : batches) {
-            if (!processDirect(batch)) {
-                allSuccess = false;
-            }
-        }
-        
-        return allSuccess;
-    }
-
-    private boolean processDirect(List<SyncMessage> messages) {
+    private boolean processSingleRecord(ConsumerRecord<String, String> record) {
         try {
-            elasticsearchService.bulkIndex(messages);
+            SyncMessage message = objectMapper.readValue(record.value(), SyncMessage.class);
+            
+            if (message.getId() == null || message.getId().isEmpty()) {
+                log.warn("Message missing ID, skipping offset: {}", record.offset());
+                return true;
+            }
+
+            return processWithRetry(message);
+
+        } catch (JsonProcessingException e) {
+            log.error("Failed to parse message at offset {}: {}", record.offset(), e.getMessage());
+            totalSkipped.increment();
             return true;
         } catch (Exception e) {
-            log.error("Failed to bulk index: {}", e.getMessage(), e);
-            handleFailure(messages);
+            log.error("Failed to process message at offset {}: {}", record.offset(), e.getMessage());
             return false;
         }
     }
 
-    private void handleFailure(List<SyncMessage> messages) {
-        log.warn("Handling failure for {} messages", messages.size());
-        for (SyncMessage message : messages) {
-            retryWithBackoff(message, 1);
-        }
-    }
+    private boolean processWithRetry(SyncMessage message) {
+        int maxRetries = syncProperties.getRetry().getMaxAttempts();
+        long initialDelay = syncProperties.getRetry().getInitialIntervalMs();
+        double multiplier = syncProperties.getRetry().getMultiplier();
 
-    private void retryWithBackoff(SyncMessage message, int attempt) {
-        int maxRetries = 3;
-        long initialDelay = 1000L;
-        
-        if (attempt > maxRetries) {
-            log.error("Max retries exceeded for message id: {}", message.getId());
-            return;
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                elasticsearchService.bulkIndex(List.of(message));
+                return true;
+            } catch (Exception e) {
+                log.warn("Attempt {}/{} failed for message id: {}, error: {}", 
+                        attempt, maxRetries, message.getId(), e.getMessage());
+                
+                if (attempt < maxRetries) {
+                    totalRetried.increment();
+                    try {
+                        long delay = (long) (initialDelay * Math.pow(multiplier, attempt - 1));
+                        Thread.sleep(delay);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
         }
-        
-        try {
-            Thread.sleep(initialDelay * attempt);
-            elasticsearchService.bulkIndex(List.of(message));
-            log.info("Retry successful for message id: {}", message.getId());
-        } catch (Exception e) {
-            log.warn("Retry {} failed for message id: {}, error: {}", 
-                    attempt, message.getId(), e.getMessage());
-            retryWithBackoff(message, attempt + 1);
-        }
-    }
 
-    private List<List<SyncMessage>> partitionList(List<SyncMessage> list, int size) {
-        List<List<SyncMessage>> partitions = new ArrayList<>();
-        for (int i = 0; i < list.size(); i += size) {
-            partitions.add(list.subList(i, Math.min(i + size, list.size())));
-        }
-        return partitions;
+        log.error("All retries exhausted for message id: {}", message.getId());
+        return false;
     }
 
     public SyncStatus getStatus() {
@@ -175,20 +134,11 @@ public class MessageConsumerService {
                 .totalProcessed(totalProcessed.sum())
                 .totalSuccess(totalSuccess.sum())
                 .totalFailed(totalFailed.sum())
+                .totalRetried(totalRetried.sum())
+                .totalSkipped(totalSkipped.sum())
+                .pendingOffsets(pendingOffsets.size())
                 .lastFlushTime(lastFlushTime.get())
                 .build();
-    }
-
-    public void shutdown() {
-        executorService.shutdown();
-        try {
-            if (!executorService.awaitTermination(60, TimeUnit.SECONDS)) {
-                executorService.shutdownNow();
-            }
-        } catch (InterruptedException e) {
-            executorService.shutdownNow();
-            Thread.currentThread().interrupt();
-        }
     }
 
     @lombok.Data
@@ -197,6 +147,9 @@ public class MessageConsumerService {
         private long totalProcessed;
         private long totalSuccess;
         private long totalFailed;
+        private long totalRetried;
+        private long totalSkipped;
+        private int pendingOffsets;
         private long lastFlushTime;
     }
 }
