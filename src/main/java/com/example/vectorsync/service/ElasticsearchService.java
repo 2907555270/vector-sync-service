@@ -10,6 +10,7 @@ import co.elastic.clients.elasticsearch.core.bulk.IndexOperation;
 import com.example.vectorsync.config.SyncProperties;
 import com.example.vectorsync.model.SyncMessage;
 import com.example.vectorsync.model.VectorDocument;
+import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -29,7 +30,7 @@ public class ElasticsearchService {
     private final SyncProperties syncProperties;
     private final VectorTransformService vectorTransformService;
 
-    public BulkResponse bulkIndex(List<SyncMessage> messages) throws IOException {
+    public BulkIndexResult bulkIndex(List<SyncMessage> messages) throws IOException {
         List<BulkOperation> operations = new ArrayList<>();
 
         List<SyncMessage> toCreateOrUpdate = messages.stream()
@@ -41,13 +42,18 @@ public class ElasticsearchService {
                 .collect(Collectors.toList());
 
         for (SyncMessage message : toCreateOrUpdate) {
-            VectorDocument doc = vectorTransformService.transform(message);
-            IndexOperation<VectorDocument> indexOp = IndexOperation.of(op -> op
-                    .index(syncProperties.getElasticsearch().getIndex())
-                    .id(message.getId())
-                    .document(doc)
-            );
-            operations.add(BulkOperation.of(b -> b.index(indexOp)));
+            try {
+                VectorDocument doc = vectorTransformService.transform(message);
+                IndexOperation<VectorDocument> indexOp = IndexOperation.of(op -> op
+                        .index(syncProperties.getElasticsearch().getIndex())
+                        .id(message.getId())
+                        .document(doc)
+                );
+                operations.add(BulkOperation.of(b -> b.index(indexOp)));
+            } catch (Exception e) {
+                log.error("Failed to transform message {}: {}", message.getId(), e.getMessage());
+                throw new IOException("Failed to transform message " + message.getId(), e);
+            }
         }
 
         for (SyncMessage message : toDelete) {
@@ -60,29 +66,57 @@ public class ElasticsearchService {
 
         if (operations.isEmpty()) {
             log.debug("No operations to execute");
-            return BulkResponse.of(r -> r
-                    .took(0)
-                    .errors(false)
-                    .items(List.of())
-            );
+            BulkIndexResult result = new BulkIndexResult();
+            result.setSuccess(true);
+            result.setIndexedCount(0);
+            result.setDeletedCount(0);
+            return result;
         }
 
         BulkRequest bulkRequest = BulkRequest.of(br -> br.operations(operations));
         BulkResponse response = esClient.bulk(bulkRequest);
 
+        BulkIndexResult result = new BulkIndexResult();
+        result.setTook(response.took());
+
         if (response.errors()) {
-            log.error("Bulk operation had errors");
+            List<String> errors = new ArrayList<>();
+            int failedCount = 0;
+            int successCount = 0;
+
             for (BulkResponseItem item : response.items()) {
                 if (item.error() != null) {
-                    log.error("Error for document {}: {}", item.id(), item.error().reason());
+                    String errorMsg = String.format("Document %s failed: %s", item.id(), item.error().reason());
+                    errors.add(errorMsg);
+                    log.error(errorMsg);
+                    failedCount++;
+                } else {
+                    successCount++;
                 }
             }
+
+            result.setSuccess(false);
+            result.setIndexedCount(successCount);
+            result.setDeletedCount(toDelete.size() - failedCount);
+            result.setErrors(errors);
+            result.setFailedCount(failedCount);
+
+            log.error("Bulk operation partially failed: {} success, {} failed", successCount, failedCount);
+
+            throw new BulkIndexException(
+                    String.format("Bulk index failed: %d errors", failedCount),
+                    result
+            );
         } else {
             log.info("Successfully indexed {} documents, deleted {} documents",
                     toCreateOrUpdate.size(), toDelete.size());
+
+            result.setSuccess(true);
+            result.setIndexedCount(toCreateOrUpdate.size());
+            result.setDeletedCount(toDelete.size());
         }
 
-        return response;
+        return result;
     }
 
     public WriteResponseBase indexDocument(VectorDocument document) throws IOException {
@@ -127,5 +161,22 @@ public class ElasticsearchService {
         return esClient.count(cnt -> cnt
                 .index(syncProperties.getElasticsearch().getIndex())
         ).count();
+    }
+
+    @Getter
+    @RequiredArgsConstructor
+    public static class BulkIndexException extends RuntimeException {
+        private final BulkIndexResult result;
+    }
+
+    @Getter
+    @RequiredArgsConstructor
+    public static class BulkIndexResult {
+        private boolean success;
+        private int indexedCount;
+        private int deletedCount;
+        private int failedCount;
+        private long took;
+        private List<String> errors;
     }
 }
