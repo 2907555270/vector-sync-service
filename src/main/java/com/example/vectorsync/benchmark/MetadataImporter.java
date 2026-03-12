@@ -114,11 +114,6 @@ public class MetadataImporter {
                 }
             }
             metadata.setColumns(columns);
-            metadata.setColumnCount(columns.size());
-            metadata.setPrimaryKeys(extractPrimaryKeys(columns));
-            metadata.setForeignKeys(extractForeignKeys(columns));
-            metadata.setComplexity(calculateComplexity(metadata));
-            metadata.setFeatures(extractFeatures(metadata));
 
             tables.add(metadata);
         }
@@ -126,84 +121,11 @@ public class MetadataImporter {
         return tables;
     }
 
-    private static List<String> extractPrimaryKeys(List<String> columns) {
-        List<String> pks = new ArrayList<>();
-        for (String col : columns) {
-            String lower = col.toLowerCase();
-            if (lower.endsWith("_id") || lower.equals("id")) {
-                pks.add(col);
-            }
-        }
-        return pks;
-    }
-
-    private static List<String> extractForeignKeys(List<String> columns) {
-        List<String> fks = new ArrayList<>();
-        for (String col : columns) {
-            String lower = col.toLowerCase();
-            if (lower.contains("_id") && !lower.endsWith("_id")) {
-                fks.add(col);
-            }
-        }
-        return fks;
-    }
-
-    private static String calculateComplexity(TableMetadata metadata) {
-        int colCount = metadata.getColumnCount();
-        int pkCount = metadata.getPrimaryKeys().size();
-
-        if (colCount <= 5 && pkCount >= 1) return "SIMPLE";
-        if (colCount <= 10 && pkCount >= 1) return "MEDIUM";
-        return "COMPLEX";
-    }
-
-    private static Map<String, Object> extractFeatures(TableMetadata metadata) {
-        Map<String, Object> features = new HashMap<>();
-
-        boolean hasDate = false, hasNumeric = false, hasText = false, hasLocation = false;
-        List<String> types = new ArrayList<>();
-
-        for (String col : metadata.getColumns()) {
-            String lower = col.toLowerCase();
-            if (lower.contains("date") || lower.contains("year") || lower.contains("time")) {
-                hasDate = true;
-                types.add("DATE");
-            } else if (lower.contains("id") || lower.contains("count") || lower.contains("num") 
-                    || lower.contains("amount") || lower.contains("price") || lower.contains("salary")) {
-                hasNumeric = true;
-                types.add("NUMBER");
-            } else if (lower.contains("name") || lower.contains("title") || lower.contains("desc")) {
-                hasText = true;
-                types.add("TEXT");
-            } else if (lower.contains("country") || lower.contains("city") || lower.contains("location")) {
-                hasLocation = true;
-                types.add("LOCATION");
-            } else {
-                types.add("OTHER");
-            }
-        }
-
-        features.put("hasDateColumn", hasDate);
-        features.put("hasNumericColumn", hasNumeric);
-        features.put("hasTextColumn", hasText);
-        features.put("hasLocationColumn", hasLocation);
-        features.put("hasRelationship", !metadata.getForeignKeys().isEmpty());
-        features.put("columnTypes", types);
-
-        return features;
-    }
-
     private static SyncMessage toSyncMessage(TableMetadata metadata, int index) {
         Map<String, Object> data = new HashMap<>();
         data.put("database", metadata.getDatabase());
         data.put("tableName", metadata.getTableName());
         data.put("columns", metadata.getColumns());
-        data.put("columnCount", metadata.getColumnCount());
-        data.put("primaryKeys", metadata.getPrimaryKeys());
-        data.put("foreignKeys", metadata.getForeignKeys());
-        data.put("complexity", metadata.getComplexity());
-        data.put("features", metadata.getFeatures());
-        data.put("index", index);
 
         return SyncMessage.builder()
                 .id(String.valueOf(index))
@@ -219,11 +141,6 @@ public class MetadataImporter {
         private String database;
         private String tableName;
         private List<String> columns;
-        private int columnCount;
-        private List<String> primaryKeys;
-        private List<String> foreignKeys;
-        private String complexity;
-        private Map<String, Object> features;
 
         public String getDatabase() { return database; }
         public void setDatabase(String database) { this.database = database; }
@@ -231,15 +148,5 @@ public class MetadataImporter {
         public void setTableName(String tableName) { this.tableName = tableName; }
         public List<String> getColumns() { return columns; }
         public void setColumns(List<String> columns) { this.columns = columns; }
-        public int getColumnCount() { return columnCount; }
-        public void setColumnCount(int columnCount) { this.columnCount = columnCount; }
-        public List<String> getPrimaryKeys() { return primaryKeys; }
-        public void setPrimaryKeys(List<String> primaryKeys) { this.primaryKeys = primaryKeys; }
-        public List<String> getForeignKeys() { return foreignKeys; }
-        public void setForeignKeys(List<String> foreignKeys) { this.foreignKeys = foreignKeys; }
-        public String getComplexity() { return complexity; }
-        public void setComplexity(String complexity) { this.complexity = complexity; }
-        public Map<String, Object> getFeatures() { return features; }
-        public void setFeatures(Map<String, Object> features) { this.features = features; }
     }
 }

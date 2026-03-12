@@ -7,7 +7,6 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
-import java.util.stream.Collectors;
 
 @Slf4j
 @Service
@@ -73,30 +72,6 @@ public class VectorTransformService {
         List<String> columns = (List<String>) data.get("columns");
         if (columns != null) {
             content.append(String.join(" ", columns)).append(" ");
-        }
-
-        List<String> primaryKeys = (List<String>) data.get("primaryKeys");
-        if (primaryKeys != null && !primaryKeys.isEmpty()) {
-            content.append("primary key ").append(String.join(" ", primaryKeys)).append(" ");
-        }
-
-        List<String> foreignKeys = (List<String>) data.get("foreignKeys");
-        if (foreignKeys != null && !foreignKeys.isEmpty()) {
-            content.append("foreign key ").append(String.join(" ", foreignKeys)).append(" ");
-        }
-
-        String complexity = (String) data.get("complexity");
-        if (complexity != null) {
-            content.append(complexity).append(" ");
-        }
-
-        Map<String, Object> features = (Map<String, Object>) data.get("features");
-        if (features != null) {
-            features.forEach((key, value) -> {
-                if (Boolean.TRUE.equals(value)) {
-                    content.append(key.replace("has", "").toLowerCase()).append(" ");
-                }
-            });
         }
 
         return content.toString().trim();
