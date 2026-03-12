@@ -27,6 +27,9 @@ public class KafkaConsumerConfig {
     @Value("${spring.kafka.consumer.batch-size:500}")
     private int batchSize;
 
+    @Value("${spring.kafka.consumer.concurrency:10}")
+    private int concurrency;
+
     @Value("${spring.kafka.consumer.max-poll-records:500}")
     private int maxPollRecords;
 
@@ -56,8 +59,8 @@ public class KafkaConsumerConfig {
         factory.setConsumerFactory(consumerFactory);
         factory.setBatchListener(true);
         factory.getContainerProperties().setPollTimeout(pollTimeout);
-        factory.getContainerProperties().setAckMode(ContainerProperties.AckMode.MANUAL_IMMEDIATE);
-        factory.setConcurrency(3);
+        factory.getContainerProperties().setAckMode(ContainerProperties.AckMode.MANUAL);
+        factory.setConcurrency(concurrency);
         return factory;
     }
 }
