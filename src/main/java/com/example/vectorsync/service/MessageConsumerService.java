@@ -66,12 +66,15 @@ public class MessageConsumerService {
         log.info("Received batch of {} messages", records.size());
 
         long batchStartOffset = records.get(0).offset();
-        long batchEndOffset = records.get(records.size() - 1).offset();
 
         List<ConsumerRecord<String, String>> successRecords = new ArrayList<>();
-        List<ConsumerRecord<String, String>> failedRecords = new ArrayList<>();
 
         for (ConsumerRecord<String, String> record : records) {
+            if (paused.get()) {
+                log.warn("Consumer paused during batch processing, stopping at offset {}", record.offset());
+                break;
+            }
+
             try {
                 SyncMessage message = objectMapper.readValue(record.value(), SyncMessage.class);
                 
@@ -82,15 +85,19 @@ public class MessageConsumerService {
                     continue;
                 }
 
-                boolean success = processWithRetry(message);
+                boolean success = processWithEarlyFailureCheck(message);
                 
                 if (success) {
                     successRecords.add(record);
                     totalSuccess.increment();
                 } else {
-                    failedRecords.add(record);
                     totalFailed.increment();
                     failedMessageIds.add(message.getId());
+                    
+                    if (checkAndTriggerPause()) {
+                        log.error("Pausing consumer due to consecutive failures after processing offset {}", record.offset());
+                        break;
+                    }
                 }
 
             } catch (JsonProcessingException e) {
@@ -99,42 +106,41 @@ public class MessageConsumerService {
                 totalSkipped.increment();
             } catch (Exception e) {
                 log.error("Failed to process message at offset {}: {}", record.offset(), e.getMessage());
-                failedRecords.add(record);
                 totalFailed.increment();
+                
+                if (checkAndTriggerPause()) {
+                    log.error("Pausing consumer due to consecutive failures after processing offset {}", record.offset());
+                    break;
+                }
             }
         }
 
-        totalProcessed.add(records.size());
-
-        if (!failedRecords.isEmpty()) {
-            int currentFailures = consecutiveFailures.addAndGet(failedRecords.size());
-            log.warn("Batch {}-{} had {} failed records, consecutive failures: {}", 
-                    batchStartOffset, batchEndOffset, failedRecords.size(), currentFailures);
-
-            if (currentFailures >= syncProperties.getRetry().getMaxConsecutiveFailures()) {
-                log.error("Max consecutive failures reached ({}), pausing consumer", 
-                        syncProperties.getRetry().getMaxConsecutiveFailures());
-                pause();
-            }
-        } else {
-            consecutiveFailures.set(0);
-            failedMessageIds.clear();
-        }
+        totalProcessed.add(successRecords.size());
 
         if (!successRecords.isEmpty()) {
             acknowledgment.acknowledge();
             log.info("Acknowledged {} records", successRecords.size());
         }
 
+        if (consecutiveFailures.get() == 0) {
+            failedMessageIds.clear();
+        }
+
         lastFlushTime.set(System.currentTimeMillis());
     }
 
-    private boolean processWithRetry(SyncMessage message) {
+    private boolean processWithEarlyFailureCheck(SyncMessage message) {
         int maxRetries = syncProperties.getRetry().getMaxAttempts();
         long initialDelay = syncProperties.getRetry().getInitialIntervalMs();
         double multiplier = syncProperties.getRetry().getMultiplier();
 
         for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            if (paused.get()) {
+                log.warn("Consumer paused during retry, abandoning message {}", message.getId());
+                consecutiveFailures.incrementAndGet();
+                return false;
+            }
+
             try {
                 elasticsearchService.bulkIndex(List.of(message));
                 return true;
@@ -156,6 +162,18 @@ public class MessageConsumerService {
         }
 
         log.error("All retries exhausted for message id: {}", message.getId());
+        consecutiveFailures.incrementAndGet();
+        return false;
+    }
+
+    private boolean checkAndTriggerPause() {
+        int currentFailures = consecutiveFailures.get();
+        int maxConsecutive = syncProperties.getRetry().getMaxConsecutiveFailures();
+        
+        if (currentFailures >= maxConsecutive) {
+            pause();
+            return true;
+        }
         return false;
     }
 
@@ -166,8 +184,8 @@ public class MessageConsumerService {
                 if (container != null) {
                     container.pause();
                     paused.set(true);
-                    log.warn("Consumer PAUSED due to consecutive failures. Failed message IDs: {}", 
-                            failedMessageIds);
+                    log.error("Consumer PAUSED due to consecutive failures ({}). Failed message IDs: {}", 
+                            consecutiveFailures.get(), failedMessageIds);
                 }
             } catch (Exception e) {
                 log.error("Failed to pause consumer: {}", e.getMessage());
@@ -183,6 +201,7 @@ public class MessageConsumerService {
                     container.resume();
                     paused.set(false);
                     consecutiveFailures.set(0);
+                    failedMessageIds.clear();
                     log.info("Consumer RESUMED successfully");
                 }
             } catch (Exception e) {
