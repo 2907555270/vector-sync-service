@@ -19,22 +19,44 @@ public class DataPreparationService {
 
     private final KafkaTemplate<String, String> kafkaTemplate;
     private final ObjectMapper objectMapper;
+    private final TableMetadataService tableMetadataService;
 
     @Value("${sync.kafka.topic}")
     private String topic;
 
-    public DataPreparationService(KafkaTemplate<String, String> kafkaTemplate, ObjectMapper objectMapper) {
+    public DataPreparationService(KafkaTemplate<String, String> kafkaTemplate, 
+                                  ObjectMapper objectMapper,
+                                  TableMetadataService tableMetadataService) {
         this.kafkaTemplate = kafkaTemplate;
         this.objectMapper = objectMapper;
+        this.tableMetadataService = tableMetadataService;
     }
 
     public PrepareResult prepareTestData(int count, String dataType) {
-        log.info("Starting to prepare {} test records", count);
+        if ("table_metadata".equals(dataType)) {
+            return prepareTableMetadata(count);
+        }
+        return prepareBusinessData(count, dataType);
+    }
+
+    public PrepareResult prepareTableMetadata(int count) {
+        log.info("Starting to prepare {} table metadata records", count);
         long startTime = System.currentTimeMillis();
 
         AtomicInteger successCount = new AtomicInteger(0);
         AtomicInteger failedCount = new AtomicInteger(0);
         List<String> errors = Collections.synchronizedList(new ArrayList<>());
+
+        List<TableMetadataService.TableMetadata> allTables = tableMetadataService.getAllTables();
+        if (allTables.isEmpty()) {
+            log.error("No table metadata found");
+            PrepareResult result = new PrepareResult();
+            result.setTotalRequested(count);
+            result.setSuccessCount(0);
+            result.setFailedCount(count);
+            result.setErrors(List.of("No table metadata found in metadatas.json"));
+            return result;
+        }
 
         ExecutorService executor = Executors.newFixedThreadPool(10);
         CountDownLatch latch = new CountDownLatch(count);
@@ -43,14 +65,14 @@ public class DataPreparationService {
             final int index = i;
             executor.submit(() -> {
                 try {
-                    SyncMessage message = generateMessage(index, dataType);
+                    int tableIndex = index % allTables.size();
+                    TableMetadataService.TableMetadata table = allTables.get(tableIndex);
+                    SyncMessage message = tableMetadataService.toSyncMessage(table, index);
+                    
                     String json = objectMapper.writeValueAsString(message);
-
-                    SendResult<String, String> result = kafkaTemplate.send(topic, message.getId(), json).get(30, TimeUnit.SECONDS);
-
-                    if (result != null) {
-                        successCount.incrementAndGet();
-                    }
+                    kafkaTemplate.send(topic, message.getId(), json).get(30, TimeUnit.SECONDS);
+                    
+                    successCount.incrementAndGet();
                 } catch (Exception e) {
                     failedCount.incrementAndGet();
                     errors.add("Index " + index + ": " + e.getMessage());
@@ -77,15 +99,15 @@ public class DataPreparationService {
         result.setDurationMs(duration);
         result.setTps(count * 1000L / Math.max(duration, 1));
         result.setErrors(errors);
-        result.setEndOffset(getTopicEndOffset());
+        result.setMetadataCount(allTables.size());
 
-        log.info("Data preparation completed. Success: {}, Failed: {}, Duration: {}ms",
-                successCount.get(), failedCount.get(), duration);
+        log.info("Table metadata preparation completed. Success: {}, Failed: {}, Duration: {}ms, Available tables: {}",
+                successCount.get(), failedCount.get(), duration, allTables.size());
 
         return result;
     }
 
-    private SyncMessage generateMessage(int index, String dataType) {
+    public PrepareResult prepareBusinessData(int count, String dataType) {
         Map<String, Object> data = new HashMap<>();
         data.put("id", index);
         data.put("index", index);
@@ -145,5 +167,6 @@ public class DataPreparationService {
         private long tps;
         private List<String> errors;
         private long endOffset;
+        private int metadataCount;
     }
 }
