@@ -10,7 +10,8 @@
 2. [Kafka 环境配置](#2-kafka-环境配置)
 3. [Kafka 使用指南](#3-kafka-使用指南)
 4. [遇到的问题及解决方案](#4-遇到的问题及解决方案)
-5. [注意事项与建议](#5-注意事项与建议)
+5. [Kafka 消费者暂停/恢复机制原理](#5-kafka-消费者暂停恢复机制原理)
+6. [注意事项与建议](#6-注意事项与建议)
 
 ---
 
@@ -454,9 +455,7 @@ Topic [P0, P1, P2, P3]
 
 ---
 
-## 2. Kafka 使用指南
-
-### 2.1 Topic 创建与管理
+## 3. Kafka 使用指南
 
 #### Topic 核心概念
 
@@ -491,9 +490,20 @@ kafka-topics.sh \
 | partitions | 6-10 | 20-50+ |
 | replication-factor | 1 | 3 |
 
-### 2.2 生产者实现
+# 查看 Topic
+``` bash
+kafka-topics.sh --list --bootstrap-server 192.168.116.5:9092
+```
 
-#### Spring Kafka Template
+# 查看消费组状态
+```bash
+kafka-consumer-groups.sh \
+  --bootstrap-server 192.168.116.5:9092 \
+  --group vector-sync-group \
+  --describe
+```
+
+### 3.2 生产者实现
 
 ```java
 @Service
@@ -528,7 +538,7 @@ public class DataProducerService {
 }
 ```
 
-### 2.3 消费者实现
+### 3.3 消费者实现
 
 #### 批量消费模式
 
@@ -559,7 +569,7 @@ public class MessageConsumerService {
 }
 ```
 
-### 2.4 序列化方案
+### 3.4 序列化方案
 
 #### JSON 序列化
 
@@ -592,15 +602,25 @@ public class KafkaConfig {
 
 ---
 
-## 3. 遇到的问题及解决方案
+## 4. 遇到的问题及解决方案
 
 ### 问题 1：消费失败时偏移量仍被提交
 
 **现象**：消息处理失败，但 offset 仍然前进
 
-**原因**：
-1. 使用了 `AckMode.MANUAL_IMMEDIATE`，自动提交
-2. `bulkIndex` 不抛异常
+**环境信息**：
+- Kafka 版本：2.8+
+- Spring Kafka 版本：3.0+
+- 消费模式：批量消费
+
+**排查过程**：
+1. 检查消费者日志，发现消息处理报错但 offset 仍前进
+2. 检查配置，发现使用了 `AckMode.MANUAL_IMMEDIATE`
+3. 检查 `bulkIndex` 方法，发现即使 ES 返回错误也不抛异常
+
+**根本原因**：
+1. 使用了 `AckMode.MANUAL_IMMEDIATE`，每次 poll 后自动提交
+2. `bulkIndex` 方法即使返回错误也不会抛出异常
 
 **解决方案**：
 ```java
@@ -613,13 +633,25 @@ if (success) {
 }
 ```
 
-### 问题 2：循环消费
+**验证结果**：消息处理失败后，offset 不再自动前进。
 
-**现象**：消息处理失败后反复消费
+---
 
-**原因**：
-- 失败消息不 ack，保留在队列
-- 没有失败阈值检测
+### 问题 2：循环消费导致资源浪费
+
+**现象**：下游服务持续报错，消费者反复消费相同消息
+
+**环境信息**：同问题1
+
+**排查过程**：
+1. 检查日志，发现同一批消息反复消费
+2. 检查下游服务（ES），发现连接超时
+3. 分析代码，发现失败消息不 ack，会被重新消费
+
+**根本原因**：
+1. 失败后不 ack，消息保留在队列
+2. 没有失败阈值检测机制
+3. 没有暂停/恢复机制
 
 **解决方案**：
 ```java
@@ -627,16 +659,504 @@ if (success) {
 private AtomicInteger consecutiveFailures = new AtomicInteger(0);
 
 // 超过阈值自动暂停
-if (consecutiveFailures.get() >= 10) {
+if (consecutiveFailures.get() >= maxConsecutiveFailures) {
     container.pause();
 }
 ```
 
+**验证结果**：连续失败达到阈值后，消费者自动暂停。
+
 ---
 
-## 4. 注意事项与建议
+### 问题 3：Kafka 不支持部分 offset 提交
 
-### 4.1 性能优化
+**现象**：批量消费时，部分成功部分失败，不知道如何处理
+
+**根本原因**：
+Kafka 的 offset 提交是"截至式"的 - 提交 offset=3 意味着已处理 0,1,2,3，不支持跳跃式提交。
+
+**解决方案**：
+```java
+// 方案1：整批处理
+if (failCount == 0) {
+    ack.acknowledge(); // 全部成功才提交
+} else {
+    // 全部失败或部分失败，整批重试
+}
+
+// 方案2：按成功率判断
+double successRate = (double) successCount / totalCount;
+if (successRate >= threshold) {
+    ack.acknowledge(); // 成功率足够，提交
+    sendFailedToRetry(failedRecords); // 失败的发到重试队列
+}
+```
+
+**验证结果**：根据成功率决定是否提交，避免重复消费。
+
+---
+
+### 问题 4：部分成功时的重试机制优化
+
+**现象**：
+- 全部失败 → 下游故障，应该暂停
+- 部分失败 → 临时故障，重试才有意义
+
+**解决方案**：
+```java
+boolean allFailed = failCount == totalCount;
+boolean hasSuccess = successCount > 0;
+double successRate = (double) successCount / totalCount;
+
+if (allFailed) {
+    // 全部失败：下游故障，暂停消费者
+    consecutiveBatchFailures.incrementAndGet();
+    if (consecutiveBatchFailures >= maxConsecutive) {
+        pause();
+    }
+} else if (hasSuccess && successRate >= threshold) {
+    // 部分成功：临时故障，发送到重试队列
+    sendFailedToRetry(failedRecords);
+}
+```
+
+**验证结果**：下游故障时及时暂停，临时故障时允许重试。
+
+---
+
+### 问题 5：重试队列的简化
+
+**现象**：单独的重试队列增加系统复杂度
+
+**分析**：
+- 重试队列需要单独的消费者
+- 增加了维护成本
+
+**解决方案**：
+```java
+// 失败消息发回原队列末尾
+ProducerRecord<String, String> producerRecord = new ProducerRecord<>(
+    record.topic(),
+    record.partition(),
+    record.timestamp(),
+    record.key(),
+    record.value()
+);
+kafkaTemplate.send(producerRecord);
+```
+
+**验证结果**：简化了架构，失败消息在原队列重试。
+
+---
+
+### 问题 6：死信消息处理
+
+**现象**：超过重试次数的消息需要保存供后续排查
+
+**解决方案**：
+```java
+// 发送到死信队列
+@Value("${sync.dlq.topic:data-sync-dlq}")
+private String dlqTopic;
+
+private void sendToDlq(SyncMessage message, String originalValue, String reason) {
+    Map<String, Object> dlqData = new HashMap<>();
+    dlqData.put("original_message", message);
+    dlqData.put("original_value", originalValue);
+    dlqData.put("dlq_reason", reason);
+    dlqData.put("dlq_timestamp", System.currentTimeMillis());
+    
+    ProducerRecord<String, String> dlqRecord = new ProducerRecord<>(
+        dlqTopic, message.getId(), new ObjectMapper().writeValueAsString(dlqData));
+    kafkaTemplate.send(dlqRecord);
+}
+```
+
+**验证结果**：失败消息保存到 DLQ，可供后续人工排查。
+
+---
+
+## 5. Kafka 消费者暂停/恢复机制原理
+
+### 5.1 概述
+
+Kafka 消费者的 `pause()` 和 `resume()` 是 Spring Kafka 提供的功能，用于临时停止/恢复消费者从 Broker 拉取消息。本节深入分析其内部实现原理。
+
+### 5.2 暂停状态的实现方式
+
+#### 5.2.1 忙等（Busy Waiting）机制
+
+```
+┌─────────────────────────────────────────────────────────┐
+│              消费者线程执行流程                          │
+├─────────────────────────────────────────────────────────┤
+│  1. consumer.poll()                                     │
+│       ↓                                                 │
+│  2. 检查 paused 标志                                     │
+│       ↓                                                 │
+│  3. 如果 paused = true:                                 │
+│       ↓                                                 │
+│       ┌─────────────────────────────────────────────┐  │
+│       │  while (paused) {                           │  │
+│       │      Thread.sleep(100);  // 忙等             │  │
+│       │      // 继续检查 paused 标志                │  │
+│       │      // 不调用 poll，返回空集合              │  │
+│       │  }                                           │  │
+│       └─────────────────────────────────────────────┘  │
+│       ↓                                                 │
+│  4. 如果 paused = false:                                 │
+│       ↓                                                 │
+│       正常调用 consumer.poll() 获取消息                   │
+└─────────────────────────────────────────────────────────┘
+```
+
+**关键点**：
+- `pause()` 不会真正停止消费者线程
+- 只是设置一个标志位
+- 消费者线程在 `poll()` 时检查该标志
+- 如果暂停，返回空集合而不是真正拉取消息
+
+#### 5.2.2 Spring Kafka 源码分析
+
+```java
+// Spring Kafka 中的实现
+public class ConcurrentKafkaListenerContainerFactory {
+    
+    public void pause() {
+        for (MessageListenerContainer container : this containers) {
+            container.pause();
+        }
+    }
+    
+    public void resume() {
+        for (MessageListenerContainer container : this.containers) {
+            container.resume();
+        }
+    }
+}
+
+// MessageListenerContainer 中的 paused 标志
+public abstract class AbstractMessageListenerContainer {
+    
+    private final AtomicBoolean paused = new AtomicBoolean(false);
+    
+    public void pause() {
+        this.paused.set(true);
+    }
+    
+    public void resume() {
+        this.paused.set(false);
+    }
+    
+    protected boolean isPaused() {
+        return this.paused.get();
+    }
+}
+```
+
+### 5.3 暂停期间的心跳维持
+
+#### 5.3.1 心跳机制原理
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Kafka 心跳机制                           │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│   Consumer                          Coordinator             │
+│      │                                  │                   │
+│      │────── Heartbeat Request ────────▶│                   │
+│      │◀───── Heartbeat Response ───────│                   │
+│      │                                  │                   │
+│      │────── Heartbeat Request ────────▶│                   │
+│      │◀───── Heartbeat Response ───────│                   │
+│      │                                  │                   │
+│   关键：心跳在后台线程执行，不受 poll 影响                   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 5.3.2 暂停不会影响心跳的原因
+
+**核心原因**：Kafka 的心跳是由**独立的后台线程**执行的，与 `poll()` 方法无关。
+
+```java
+// Kafka Consumer 内部结构
+public class KafkaConsumer<K, V> {
+    
+    // 心跳线程（独立于主消费者线程）
+    private final HeartbeatThread heartbeatThread;
+    
+    // 主消费者线程
+    private class ConsumerLoop implements Runnable {
+        public void run() {
+            while (running) {
+                // 这里检查 pause 标志
+                if (!paused) {
+                    consumer.poll(pollTimeout);
+                } else {
+                    // 条件阻塞，线程挂起
+                }
+            }
+        }
+    }
+    
+    // 心跳线程（始终运行，不受 pause 影响）
+    private class HeartbeatThread implements Runnable {
+        public void run() {
+            while (running) {
+                sendHeartbeat();
+                Thread.sleep(heartbeatInterval);
+            }
+        }
+    }
+}
+```
+
+**关键配置参数**：
+
+| 参数 | 说明 | 推荐值 |
+|------|------|--------|
+| `session.timeout.ms` | 会话超时时间，默认 10 秒 | 100000 (100秒) |
+| `heartbeat.interval.ms` | 心跳间隔，默认 3 秒 | 30000 (30秒) |
+| `max.poll.interval.ms` | 两次 poll 最大间隔，默认 5 分钟 | 300000 (5分钟) |
+
+#### 5.3.3 为什么暂停不会触发 Rebalance
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                  Rebalance 触发条件                      │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  1. 消费者心跳超时                                       │
+│     └── 暂停期间心跳仍在继续 → 不会超时                   │
+│                                                         │
+│  2. 消费者主动离开组                                     │
+│     └── pause() 不主动离开组 → 不会触发                   │
+│                                                         │
+│  3. 消费者被强制下线                                     │
+│     └── pause() 不改变组状态 → 不会触发                   │
+│                                                         │
+│  结论：pause() 只是暂停消费，不改变消费者组状态            │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 5.4 暂停/恢复对消费者组的影响
+
+#### 5.4.1 消费者组状态
+
+```
+                    消费者组状态转换
+                          
+    ┌──────────┐      join       ┌──────────┐
+    │  Empty   │ ──────────────▶│ Stable   │
+    └──────────┘                └────┬─────┘
+                                     │
+                                     │ rebalance
+                                     ▼
+                              ┌──────────┐
+                              │ Rebalancing │
+                              └──────────┘
+```
+
+**暂停/恢复对状态的影响**：
+
+| 操作 | 消费者组状态 | 分区分配 | 说明 |
+|------|-------------|---------|------|
+| `pause()` | Stable | 不变 | 消费者暂停拉取，但仍是组成员 |
+| `resume()` | Stable | 不变 | 消费者恢复拉取 |
+
+#### 5.4.2 分区分配保持不变
+
+```
+暂停前:
+Topic: data-sync-topic [P0, P1, P2]
+                    │
+                    ▼
+Consumer Group: [C1 → P0], [C2 → P1], [C3 → P2]
+
+暂停后:
+Topic: data-sync-topic [P0, P1, P2]
+                    │
+                    ▼
+Consumer Group: [C1 → P0 (paused)], [C2 → P1], [C3 → P2]
+                    │
+                    ▼
+分区分配不变，只是 C1 暂停消费
+
+恢复后:
+Topic: data-sync-topic [P0, P1, P2]
+                    │
+                    ▼
+Consumer Group: [C1 → P0], [C2 → P1], [C3 → P2]
+                    │
+                    ▼
+分区分配完全恢复
+```
+
+### 5.5 暂停期间的消息处理
+
+#### 5.5.1 消息状态
+
+```
+时间线:
+
+T1: poll() 获取消息 [msg1, msg2, msg3]
+         ↓
+T2: 消息处理中...
+         ↓
+T3: 调用 pause()
+         ↓
+T4: 已获取的消息继续处理完成
+         ↓
+T5: 下次 poll() → 返回空（暂停状态）
+         ↓
+T6: 条件阻塞，直到调用 resume()
+         ↓
+T7: resume() → 恢复正常 poll()
+```
+
+**关键点**：
+- `pause()` 不会中断正在处理的消息
+- 已获取的消息会继续处理完成
+- 暂停后、下次 poll 返回空
+
+#### 5.5.2 偏移量提交
+
+```
+场景：处理消息时调用 pause()
+
+1. poll() 获取消息 [msg1, msg2, msg3]
+         ↓
+2. 开始处理 msg1
+         ↓
+3. msg1 处理成功 → commit offset 1
+         ↓
+4. 调用 pause()
+         ↓
+5. msg2, msg3 继续处理完成（如果业务代码没有检查 pause）
+         ↓
+6. 如果没有手动 commit，offset 停留在 msg1
+         ↓
+7. resume() 后，会重新消费 msg2, msg3
+```
+
+**风险提示**：如果在处理过程中调用 `pause()`，可能导致部分消息被重复消费。
+
+### 5.6 配置参数的作用
+
+#### 5.6.1 session.timeout.ms
+
+```properties
+# 默认值：100000 (10秒)
+# 作用：消费者必须在该时间内发送心跳，否则被认为已死
+
+# 如果暂停时间超过此值，会发生什么？
+# 答：不会！因为心跳线程独立运行，不受 pause() 影响
+```
+
+#### 5.6.2 heartbeat.interval.ms
+
+```properties
+# 默认值：30000 (3秒)
+# 作用：心跳发送间隔
+
+# 建议值：session.timeout.ms / 3
+# 例如：session.timeout=100000 → heartbeat.interval=30000
+```
+
+#### 5.6.3 max.poll.interval.ms
+
+```properties
+# 默认值：300000 (5分钟)
+# 作用：两次 poll 之间的最大间隔
+
+# 重要：如果暂停时间过长，可能触发此超时！
+# 因为 pause() 返回空，poll() 返回空 = 没有处理新消息
+```
+
+**风险提示**：
+```
+如果暂停时间 > max.poll.interval.ms:
+    ↓
+Consumer 被认为已死
+    ↓
+触发 Rebalance
+    ↓
+分区重新分配给其他消费者
+    ↓
+resume() 后，消费者重新加入，可能从之前位置继续消费
+```
+
+### 5.7 暂停/恢复的最佳实践
+
+#### 5.7.1 配置建议
+
+```properties
+# 延长 max.poll.interval.ms 以支持长时间暂停
+max.poll.interval.ms=600000  # 10分钟
+
+# 确保心跳频率足够高
+session.timeout.ms=100000     # 10秒
+heartbeat.interval.ms=30000  # 3秒
+```
+
+#### 5.7.2 代码示例
+
+```java
+@Service
+public class MessageConsumerService {
+
+    private final AtomicBoolean paused = new AtomicBoolean(false);
+
+    @KafkaListener(topics = "my-topic", groupId = "my-group")
+    public void consume(List<ConsumerRecord<String, String>> records,
+                        Acknowledgment ack) {
+        
+        // 检查暂停状态
+        if (paused.get()) {
+            return; // 不处理，返回
+        }
+        
+        for (ConsumerRecord<String, String> record : records) {
+            // 处理中也可以检查暂停状态
+            if (paused.get()) {
+                break;
+            }
+            // 处理消息...
+        }
+        
+        // 处理完成后提交
+        ack.acknowledge();
+    }
+
+    public void pause() {
+        paused.set(true);
+        container.pause();
+    }
+
+    public void resume() {
+        paused.set(false);
+        container.resume();
+    }
+}
+```
+
+#### 5.7.3 注意事项
+
+| 注意事项 | 说明 |
+|----------|------|
+| 暂停时间 | 不要超过 `max.poll.interval.ms`，否则会触发 Rebalance |
+| 心跳 | 暂停期间心跳继续，不会超时 |
+| 偏移量 | 暂停前的偏移量需要手动管理 |
+| 重试 | 暂停期间失败的消息，resume 后会重新消费 |
+
+---
+
+## 6. 注意事项与建议
+
+### 6.1 性能优化
 
 | 优化项 | 操作 | 效果 |
 |--------|------|------|
@@ -645,13 +1165,21 @@ if (consecutiveFailures.get() >= 10) {
 | 批量发送 | `batch.size` | 减少网络开销 |
 | 消息压缩 | `compression.type=snappy` | 减少网络传输 |
 
-### 4.2 安全性配置
+### 6.2 安全性配置
 
 | 配置 | 说明 | 场景 |
 |------|------|------|
 | SSL | 加密通信 | 生产环境 |
 | SASL | 身份认证 | 生产环境 |
 | ACL | 权限控制 | 多租户环境 |
+
+### 6.3 监控指标
+
+| 指标 | 告警阈值 | 说明 |
+|------|----------|------|
+| consumer_lag | > 10000 | 消费积压 |
+| records_consumed_rate | < 100 | 消费速率异常 |
+| failed_records_rate | > 10% | 失败率过高 |
 
 ---
 
@@ -667,9 +1195,19 @@ if (consecutiveFailures.get() >= 10) {
 | Producer | `compression.type` | snappy | 压缩 |
 | Consumer | `max.poll.records` | 500 | 批量大小 |
 | Consumer | `enable.auto.commit` | false | 手动提交 |
+| Consumer | `session.timeout.ms` | 100000 | 会话超时 |
+| Consumer | `heartbeat.interval.ms` | 30000 | 心跳间隔 |
+
+### 相关代码
+
+- `MessageConsumerService.java` - 消费者服务实现
+- `SyncController.java` - 暂停/恢复 API
+- `SyncMessage.java` - 消息模型
 
 ---
 
-**文档版本**: 1.1  
-**更新日期**: 2026-03-12  
-**更新内容**: 增加配置项原理详解
+**文档版本**: 1.2  
+**更新日期**: 2026-03-13  
+**更新内容**: 
+- 增加 Kafka 问题及解决方案
+- 增加消费者暂停/恢复机制原理详解
