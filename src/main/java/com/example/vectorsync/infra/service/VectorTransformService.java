@@ -1,7 +1,7 @@
-package com.example.vectorsync.service;
+package com.example.vectorsync.infra.service;
 
-import com.example.vectorsync.model.SyncMessage;
-import com.example.vectorsync.model.VectorDocument;
+import com.example.vectorsync.infra.model.SyncMessage;
+import com.example.vectorsync.infra.model.VectorDocument;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;

@@ -1,7 +1,7 @@
 package com.example.vectorsync.controller;
 
-import com.example.vectorsync.service.ElasticsearchService;
-import com.example.vectorsync.service.MessageConsumerService;
+import com.example.vectorsync.infra.service.ElasticsearchService;
+import com.example.vectorsync.infra.service.MessageConsumerService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;

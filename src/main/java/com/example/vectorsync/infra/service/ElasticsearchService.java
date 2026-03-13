@@ -1,4 +1,4 @@
-package com.example.vectorsync.service;
+package com.example.vectorsync.infra.service;
 
 import co.elastic.clients.elasticsearch.ElasticsearchClient;
 import co.elastic.clients.elasticsearch._types.WriteResponseBase;
@@ -7,9 +7,9 @@ import co.elastic.clients.elasticsearch.core.bulk.BulkOperation;
 import co.elastic.clients.elasticsearch.core.bulk.BulkResponseItem;
 import co.elastic.clients.elasticsearch.core.bulk.DeleteOperation;
 import co.elastic.clients.elasticsearch.core.bulk.IndexOperation;
-import com.example.vectorsync.config.SyncProperties;
-import com.example.vectorsync.model.SyncMessage;
-import com.example.vectorsync.model.VectorDocument;
+import com.example.vectorsync.infra.config.SyncProperties;
+import com.example.vectorsync.infra.model.SyncMessage;
+import com.example.vectorsync.infra.model.VectorDocument;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;

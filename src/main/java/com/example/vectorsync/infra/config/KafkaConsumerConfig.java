@@ -1,5 +1,6 @@
-package com.example.vectorsync.config;
+package com.example.vectorsync.infra.config;
 
+import com.example.vectorsync.infra.listener.CustomConsumerRebalanceListener;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.springframework.beans.factory.annotation.Value;
@@ -58,6 +59,8 @@ public class KafkaConsumerConfig {
         factory.getContainerProperties().setPollTimeout(pollTimeout);
         factory.getContainerProperties().setAckMode(ContainerProperties.AckMode.MANUAL);
         factory.setConcurrency(concurrency);
+        // rebalance listener
+        factory.getContainerProperties().setConsumerRebalanceListener(new CustomConsumerRebalanceListener());
         return factory;
     }
 }

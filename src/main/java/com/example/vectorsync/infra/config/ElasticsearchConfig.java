@@ -1,4 +1,4 @@
-package com.example.vectorsync.config;
+package com.example.vectorsync.infra.config;
 
 import co.elastic.clients.elasticsearch.ElasticsearchClient;
 import co.elastic.clients.json.jackson.JacksonJsonpMapper;

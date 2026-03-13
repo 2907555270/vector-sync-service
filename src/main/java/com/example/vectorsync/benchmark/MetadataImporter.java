@@ -1,6 +1,6 @@
 package com.example.vectorsync.benchmark;
 
-import com.example.vectorsync.model.SyncMessage;
+import com.example.vectorsync.infra.model.SyncMessage;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;

@@ -1,4 +1,4 @@
-package com.example.vectorsync.model;
+package com.example.vectorsync.infra.model;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.AllArgsConstructor;

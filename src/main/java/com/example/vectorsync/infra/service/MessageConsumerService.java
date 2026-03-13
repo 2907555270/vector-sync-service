@@ -1,7 +1,7 @@
-package com.example.vectorsync.service;
+package com.example.vectorsync.infra.service;
 
-import com.example.vectorsync.config.SyncProperties;
-import com.example.vectorsync.model.SyncMessage;
+import com.example.vectorsync.infra.config.SyncProperties;
+import com.example.vectorsync.infra.model.SyncMessage;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.Getter;

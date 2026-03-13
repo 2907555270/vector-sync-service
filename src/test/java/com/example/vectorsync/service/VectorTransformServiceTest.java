@@ -1,7 +1,8 @@
 package com.example.vectorsync.service;
 
-import com.example.vectorsync.model.SyncMessage;
-import com.example.vectorsync.model.VectorDocument;
+import com.example.vectorsync.infra.model.SyncMessage;
+import com.example.vectorsync.infra.model.VectorDocument;
+import com.example.vectorsync.infra.service.VectorTransformService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 

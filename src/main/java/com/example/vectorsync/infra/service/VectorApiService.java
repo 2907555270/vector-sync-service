@@ -1,4 +1,4 @@
-package com.example.vectorsync.service;
+package com.example.vectorsync.infra.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
