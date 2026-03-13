@@ -64,30 +64,6 @@ public class SyncMessage {
                 .build();
     }
 
-    public static SyncMessage createWithKey(String messageKey, String id, String type, Map<String, Object> data) {
-        return SyncMessage.builder()
-                .messageKey(messageKey)
-                .id(id)
-                .type(type)
-                .action(ActionType.CREATE.getValue())
-                .data(data)
-                .timestamp(Instant.now().toEpochMilli())
-                .version(1)
-                .build();
-    }
-
-    public static SyncMessage update(String id, String type, Map<String, Object> data) {
-        return SyncMessage.builder()
-                .messageKey(java.util.UUID.randomUUID().toString())
-                .id(id)
-                .type(type)
-                .action(ActionType.UPDATE.getValue())
-                .data(data)
-                .timestamp(Instant.now().toEpochMilli())
-                .version(1)
-                .build();
-    }
-
     public static SyncMessage delete(String id, String type) {
         return SyncMessage.builder()
                 .messageKey(java.util.UUID.randomUUID().toString())

@@ -7,8 +7,8 @@ spring:
     bootstrap-servers: 192.168.116.5:9092
     consumer:
       group-id: vector-sync-group
-      concurrency: 10
-      max-poll-records: 500
+      concurrency: 5
+      max-poll-records: 1
       auto-offset-reset: earliest
       enable-auto-commit: false
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
@@ -80,3 +80,4 @@ logging:
     com.example.vectorsync: DEBUG
     org.springframework.kafka: INFO
     org.elasticsearch: INFO
+

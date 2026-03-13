@@ -134,6 +134,7 @@ public class MetadataImporter {
                 .data(data)
                 .timestamp(System.currentTimeMillis())
                 .version(1)
+                .messageKey(java.util.UUID.randomUUID().toString())
                 .build();
     }
 

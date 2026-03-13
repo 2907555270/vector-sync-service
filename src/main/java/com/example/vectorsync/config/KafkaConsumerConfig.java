@@ -24,9 +24,6 @@ public class KafkaConsumerConfig {
     @Value("${spring.kafka.consumer.group-id:vector-sync-group}")
     private String groupId;
 
-    @Value("${spring.kafka.consumer.batch-size:500}")
-    private int batchSize;
-
     @Value("${spring.kafka.consumer.concurrency:10}")
     private int concurrency;
 
