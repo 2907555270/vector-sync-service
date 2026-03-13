@@ -71,10 +71,13 @@ public class MessageConsumerService {
 
         int successCount = 0;
         int failCount = 0;
+        boolean pausedFlag = false;
 
+        List<String> failedMessages = new ArrayList<>();
         for (ConsumerRecord<String, String> record : records) {
             if (paused.get()) {
                 log.warn("Consumer paused during batch processing");
+                pausedFlag = true;
                 break;
             }
 
@@ -92,7 +95,7 @@ public class MessageConsumerService {
                     successCount++;
                     retryService.clearRetryCount(message.getId());
                 } else {
-                    failCount++;
+                    failedMessages.add(record.value());
                 }
 
             } catch (JsonProcessingException e) {
@@ -100,19 +103,22 @@ public class MessageConsumerService {
                 successCount++;
             } catch (Exception e) {
                 log.error("Failed to process message at offset {}: {}", record.offset(), e.getMessage());
-                failCount++;
+                failedMessages.add(record.value());
             }
         }
 
         totalProcessed.add(records.size());
 
-        if (failCount == 0) {
+        failCount = failedMessages.size();
+        if (pausedFlag) {
+            // 暂停消费，不返回ack，允许消息被重复消费，因为此时的统计数据可能不完整
+        } else if (failCount == 0) {
             acknowledgment.acknowledge();
             totalSuccess.add(successCount);
             consecutiveBatchFailures.set(0);
             log.info("Batch all success, acknowledged {} records", successCount);
         } else if (successCount == 0) {
-            acknowledgment.acknowledge();
+            // 没有成功的
             totalFailed.add(failCount);
             int batchFailures = consecutiveBatchFailures.incrementAndGet();
             log.error("Batch all failed ({}), consecutive batch failures: {}", failCount, batchFailures);
@@ -121,6 +127,7 @@ public class MessageConsumerService {
                 pause();
             }
         } else {
+            // 部分成功或失败
             acknowledgment.acknowledge();
             totalSuccess.add(successCount);
             totalFailed.add(failCount);
@@ -129,11 +136,11 @@ public class MessageConsumerService {
             log.warn("Batch partially failed ({} success, {} failed), sending failed to retry queue", 
                 successCount, failCount);
             
-            for (ConsumerRecord<String, String> record : records) {
+            for (String record : failedMessages) {
                 try {
-                    SyncMessage message = objectMapper.readValue(record.value(), SyncMessage.class);
+                    SyncMessage message = objectMapper.readValue(record, SyncMessage.class);
                     if (message.getId() != null && !message.getId().isEmpty()) {
-                        handleFailedMessage(message, record.value());
+                        handleFailedMessage(message, record);
                     }
                 } catch (Exception e) {
                     log.error("Failed to handle failed record: {}", e.getMessage());
@@ -168,9 +175,13 @@ public class MessageConsumerService {
 
         int successCount = 0;
         int failCount = 0;
+        boolean pausedFlag =  false;
 
+        List<String> failedMessages = new ArrayList<>();
         for (ConsumerRecord<String, String> record : records) {
             if (paused.get()) {
+                log.warn("Consumer is paused, not processing retry records");
+                pausedFlag = true;
                 break;
             }
 
@@ -188,51 +199,45 @@ public class MessageConsumerService {
                     successCount++;
                     retryService.clearRetryCount(message.getId());
                 } else {
-                    failCount++;
+                    failedMessages.add(record.value());
                 }
 
             } catch (Exception e) {
                 log.error("Failed to process retry message: {}", e.getMessage());
-                failCount++;
+                failedMessages.add(record.value());
             }
         }
 
-        if (failCount == 0) {
+        failCount = failedMessages.size();
+        if (pausedFlag) {
+            // 暂停消费，不返回ack，允许消息被重复消费，因为此时的统计数据可能不完整
+        } else if (failCount == 0) {
+            // 正常消费，没有失败的
             acknowledgment.acknowledge();
             totalSuccess.add(successCount);
             retryConsecutiveBatchFailures.set(0);
             log.info("Retry batch all success, acknowledged");
         } else if (successCount == 0) {
-            acknowledgment.acknowledge();
+            // 正常消费，没有成功的，不返回ack，全批次失败
             totalFailed.add(failCount);
             int batchFailures = retryConsecutiveBatchFailures.incrementAndGet();
             log.error("Retry batch all failed, consecutive batch failures: {}", batchFailures);
-            
-            for (ConsumerRecord<String, String> record : records) {
-                try {
-                    SyncMessage message = objectMapper.readValue(record.value(), SyncMessage.class);
-                    if (message.getId() != null) {
-                        handleRetryFailedMessage(message, record.value(), "Retry batch all failed");
-                    }
-                } catch (Exception e) {
-                    log.error("Failed to send to DLQ: {}", e.getMessage());
-                }
-            }
-            
+
             if (batchFailures >= syncProperties.getRetry().getMaxConsecutiveFailures()) {
                 pause();
             }
         } else {
+            // 部分成功，全部提交，然后失败的转移到重试队列
             acknowledgment.acknowledge();
             totalSuccess.add(successCount);
             totalFailed.add(failCount);
             retryConsecutiveBatchFailures.set(0);
             
-            for (ConsumerRecord<String, String> record : records) {
+            for (String record : failedMessages) {
                 try {
-                    SyncMessage message = objectMapper.readValue(record.value(), SyncMessage.class);
+                    SyncMessage message = objectMapper.readValue(record, SyncMessage.class);
                     if (message.getId() != null) {
-                        handleRetryFailedMessage(message, record.value(), "Retry partially failed");
+                        handleRetryFailedMessage(message, record, "Retry partially failed");
                     }
                 } catch (Exception e) {
                     log.error("Failed to handle retry failed message: {}", e.getMessage());
