@@ -69,7 +69,9 @@ public class MessageConsumerService {
 
         log.info("Received batch of {} messages", records.size());
 
-        int processedCount = 0;
+        List<ConsumerRecord<String, String>> processedRecords = new ArrayList<>();
+        List<ConsumerRecord<String, String>> successRecords = new ArrayList<>();
+        List<ConsumerRecord<String, String>> failedRecords = new ArrayList<>();
         boolean pausedDuringProcessing = false;
 
         for (ConsumerRecord<String, String> record : records) {
@@ -79,66 +81,64 @@ public class MessageConsumerService {
                 break;
             }
 
-            processedCount++;
+            processedRecords.add(record);
 
             try {
                 SyncMessage message = objectMapper.readValue(record.value(), SyncMessage.class);
                 
                 if (message.getId() == null || message.getId().isEmpty()) {
+                    successRecords.add(record);
                     continue;
                 }
 
                 boolean success = processWithRetry(message);
                 
                 if (success) {
-                    totalSuccess.increment();
-                    retryService.clearRetryCount(message.getId());
+                    successRecords.add(record);
+                    retryService.clearRetryCount(getMessageKey(record));
                 } else {
-                    totalFailed.increment();
+                    failedRecords.add(record);
                 }
 
             } catch (JsonProcessingException e) {
                 log.error("Failed to parse message at offset {}: {}", record.offset(), e.getMessage());
-                totalSuccess.increment();
+                successRecords.add(record);
             } catch (Exception e) {
                 log.error("Failed to process message at offset {}: {}", record.offset(), e.getMessage());
-                totalFailed.increment();
+                failedRecords.add(record);
             }
         }
 
-        totalProcessed.add(processedCount);
+        totalProcessed.add(processedRecords.size());
+        totalSuccess.add(successRecords.size());
+        totalFailed.add(failedRecords.size());
 
-        if (pausedDuringProcessing) {
-            log.warn("Paused during processing, not acknowledging. Processed {} messages", processedCount);
-            return;
-        }
+        int processedCount = processedRecords.size();
+        double successRate = processedCount > 0 ? (double) successRecords.size() / processedCount : 0;
+        double threshold = syncProperties.getRetry().getSuccessThreshold();
 
-        boolean allProcessed = processedCount == records.size();
-        boolean hasFailure = totalFailed.sum() > 0;
-
-        if (allProcessed) {
-            if (!hasFailure) {
-                acknowledgment.acknowledge();
+        boolean shouldAck = successRecords.size() > 0 && successRate >= threshold;
+        
+        if (shouldAck) {
+            acknowledgment.acknowledge();
+            
+            if (!failedRecords.isEmpty()) {
+                log.warn("Batch acknowledged with failures. Success: {}, Failed: {}, Rate: {}", 
+                    successRecords.size(), failedRecords.size(), successRate);
+                sendFailedToRetryOrDlq(failedRecords);
+            } else {
                 consecutiveBatchFailures.set(0);
                 log.info("Batch all success, acknowledged {} records", processedCount);
-            } else {
-                double successRate = (double) totalSuccess.sum() / processedCount;
-                double threshold = syncProperties.getRetry().getSuccessThreshold();
-                
-                if (successRate >= threshold) {
-                    acknowledgment.acknowledge();
-                    log.warn("Batch has failures but success rate {} >= {}, sending failed to retry queue", 
-                        successRate, threshold);
-                    sendAllToRetryOrDlq(records);
-                } else {
-                    int currentFailures = consecutiveBatchFailures.incrementAndGet();
-                    log.error("Batch success rate {} < {}, consecutive batch failures: {}", 
-                        successRate, threshold, currentFailures);
-                    
-                    if (currentFailures >= syncProperties.getRetry().getMaxConsecutiveFailures()) {
-                        pause();
-                    }
-                }
+            }
+        } else if (processedRecords.isEmpty() || pausedDuringProcessing) {
+            log.warn("Paused or empty batch, not acknowledging. Processed: {}", processedCount);
+        } else {
+            int currentFailures = consecutiveBatchFailures.incrementAndGet();
+            log.error("Batch success rate {} < {}, consecutive batch failures: {}", 
+                successRate, threshold, currentFailures);
+            
+            if (currentFailures >= syncProperties.getRetry().getMaxConsecutiveFailures()) {
+                pause();
             }
         }
 
@@ -167,10 +167,9 @@ public class MessageConsumerService {
 
         log.info("Received retry batch of {} messages", records.size());
 
-        int processedCount = 0;
+        List<ConsumerRecord<String, String>> successRecords = new ArrayList<>();
+        List<ConsumerRecord<String, String>> failedRecords = new ArrayList<>();
         boolean pausedDuringProcessing = false;
-        int successCount = 0;
-        int failCount = 0;
 
         for (ConsumerRecord<String, String> record : records) {
             if (paused.get()) {
@@ -178,95 +177,91 @@ public class MessageConsumerService {
                 break;
             }
 
-            processedCount++;
-
             try {
                 SyncMessage message = objectMapper.readValue(record.value(), SyncMessage.class);
                 
                 if (message.getId() == null || message.getId().isEmpty()) {
-                    successCount++;
+                    successRecords.add(record);
                     continue;
                 }
 
                 boolean success = processWithRetry(message);
                 
                 if (success) {
-                    successCount++;
-                    retryService.clearRetryCount(message.getId());
+                    successRecords.add(record);
+                    retryService.clearRetryCount(getMessageKey(record));
                 } else {
-                    failCount++;
+                    failedRecords.add(record);
                 }
 
             } catch (Exception e) {
                 log.error("Failed to process retry message: {}", e.getMessage());
-                failCount++;
+                failedRecords.add(record);
             }
         }
 
-        if (pausedDuringProcessing) {
-            log.warn("Paused during retry processing, not acknowledging");
-            return;
-        }
+        int processedCount = successRecords.size() + failedRecords.size();
+        double successRate = processedCount > 0 ? (double) successRecords.size() / processedCount : 0;
+        double threshold = syncProperties.getRetry().getSuccessThreshold();
 
-        boolean allProcessed = processedCount == records.size();
-
-        if (allProcessed) {
-            if (failCount == 0) {
-                acknowledgment.acknowledge();
-                retryConsecutiveBatchFailures.set(0);
-                totalSuccess.add(successCount);
-                log.info("Retry batch all success");
-            } else if (successCount == 0) {
-                totalFailed.add(failCount);
-                int batchFailures = retryConsecutiveBatchFailures.incrementAndGet();
-                log.error("Retry batch all failed, consecutive batch failures: {}", batchFailures);
-
-                if (batchFailures >= syncProperties.getRetry().getMaxConsecutiveFailures()) {
-                    pause();
-                }
+        boolean shouldAck = successRecords.size() > 0 && successRate >= threshold;
+        
+        if (shouldAck) {
+            acknowledgment.acknowledge();
+            
+            if (!failedRecords.isEmpty()) {
+                totalSuccess.add(successRecords.size());
+                totalFailed.add(failedRecords.size());
+                log.warn("Retry batch acknowledged with failures. Success: {}, Failed: {}", 
+                    successRecords.size(), failedRecords.size());
+                sendFailedToRetryOrDlq(failedRecords);
             } else {
-                double successRate = (double) successCount / processedCount;
-                double threshold = syncProperties.getRetry().getSuccessThreshold();
-                
-                totalSuccess.add(successCount);
-                totalFailed.add(failCount);
-                
-                if (successRate >= threshold) {
-                    acknowledgment.acknowledge();
-                    retryConsecutiveBatchFailures.set(0);
-                    log.warn("Retry batch success rate {} >= {}, sending failed to retry", successRate, threshold);
-                    sendAllToRetryOrDlq(records);
-                } else {
-                    int batchFailures = retryConsecutiveBatchFailures.incrementAndGet();
-                    log.error("Retry batch success rate {} < {}, consecutive batch failures: {}", 
-                        successRate, threshold, batchFailures);
-                    if (batchFailures >= syncProperties.getRetry().getMaxConsecutiveFailures()) {
-                        pause();
-                    }
-                }
+                retryConsecutiveBatchFailures.set(0);
+                totalSuccess.add(successRecords.size());
+                log.info("Retry batch all success, acknowledged");
+            }
+        } else if (processedCount == 0 || pausedDuringProcessing) {
+            log.warn("Paused or empty retry batch, not acknowledging");
+        } else {
+            totalSuccess.add(successRecords.size());
+            totalFailed.add(failedRecords.size());
+            
+            int batchFailures = retryConsecutiveBatchFailures.incrementAndGet();
+            log.error("Retry batch success rate {} < {}, consecutive batch failures: {}", 
+                successRate, threshold, batchFailures);
+            
+            sendFailedToRetryOrDlq(failedRecords);
+            
+            if (batchFailures >= syncProperties.getRetry().getMaxConsecutiveFailures()) {
+                pause();
             }
         }
     }
 
-    private void sendAllToRetryOrDlq(List<ConsumerRecord<String, String>> records) {
-        for (ConsumerRecord<String, String> record : records) {
+    private String getMessageKey(ConsumerRecord<String, String> record) {
+        return record.topic() + "-" + record.partition() + "-" + record.offset();
+    }
+
+    private void sendFailedToRetryOrDlq(List<ConsumerRecord<String, String>> failedRecords) {
+        for (ConsumerRecord<String, String> record : failedRecords) {
             try {
                 SyncMessage message = objectMapper.readValue(record.value(), SyncMessage.class);
-                if (message.getId() == null || message.getId().isEmpty()) continue;
-
-                int currentRetryCount = retryService.getRetryCount(message.getId());
+                if (message.getId() == null) continue;
+                
+                String messageKey = getMessageKey(record);
+                int currentRetryCount = retryService.getRetryCount(messageKey);
                 
                 if (currentRetryCount >= syncProperties.getRetry().getMaxAttempts()) {
-                    retryService.sendToDlq(message.getId(), record.value(), "Retry exhausted", currentRetryCount);
+                    retryService.sendToDlq(message.getId(), record.value(), "Max retries exceeded", currentRetryCount);
                     totalDlq.increment();
-                    retryService.clearRetryCount(message.getId());
+                    retryService.clearRetryCount(messageKey);
                 } else {
-                    retryService.incrementRetryCount(message.getId());
+                    retryService.incrementRetryCount(messageKey);
                     retryService.sendToRetry(message.getId(), record.value(), currentRetryCount);
                     totalRetried.increment();
                 }
             } catch (Exception e) {
-                log.error("Failed to handle retry message: {}", e.getMessage());
+                log.error("Failed to send to retry: {}", e.getMessage());
             }
         }
     }
