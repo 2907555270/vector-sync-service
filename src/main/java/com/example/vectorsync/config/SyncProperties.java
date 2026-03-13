@@ -42,6 +42,7 @@ public class SyncProperties {
         private double multiplier = 2.0;
         private long maxIntervalMs = 10000;
         private int maxConsecutiveFailures = 10;
+        private double successThreshold = 0.2;
     }
 
     @Data
