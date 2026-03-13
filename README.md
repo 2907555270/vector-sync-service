@@ -7,16 +7,16 @@
 - **Spring Boot 3.2.0** - 应用程序框架
 - **Java 17** - 开发语言
 - **Apache Kafka** - 消息队列
-- **Elasticsearch 8.11.0** - 向量数据库
+- **Elasticsearch 8.19.0** - 向量数据库
 - **Spring Kafka** - Kafka 集成
 
 ## 功能特性
 
 - **Kafka 消费**: 从 Kafka 主题消费数据同步消息，支持批量处理（详见 [Kafka 技术文档](technical_issues/kafka.md)）
 - **向量转换**: 将业务数据转换为带向量字段的文档，支持稠密向量和稀疏向量
-- **批量索引**: 高效批量写入 Elasticsearch
 - **重试机制**: 指数退避重试策略，失败消息自动进入死信队列
 - **流量控制**: 支持消费者暂停/恢复，防止故障扩散
+- **自动建索引**: 启动时自动创建 ES 索引及正确的 mapping（详见 [Spring 初始化文档](technical_issues/spring.md)）
 - **监控指标**: 提供同步状态、健康检查、文档管理等 REST API
 
 ## Kafka 核心难点
@@ -50,7 +50,7 @@
   "id": "文档ID",
   "type": "数据类型",
   "action": "操作类型 (create/update/delete)",
-  "data": { "业务数据" },
+  "data": { "业务数据": "" },
   "timestamp": "时间戳",
   "version": "版本号"
 }
