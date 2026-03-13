@@ -88,4 +88,49 @@ public class SyncController {
         
         return ResponseEntity.ok(result);
     }
+
+    @PostMapping("/pause")
+    public ResponseEntity<Map<String, Object>> pause() {
+        Map<String, Object> result = new HashMap<>();
+        
+        if (consumerService.isPaused()) {
+            result.put("success", false);
+            result.put("message", "Consumer is already paused");
+            return ResponseEntity.ok(result);
+        }
+        
+        consumerService.pause();
+        result.put("success", true);
+        result.put("message", "Consumer paused");
+        
+        return ResponseEntity.ok(result);
+    }
+
+    @PostMapping("/resume")
+    public ResponseEntity<Map<String, Object>> resume() {
+        Map<String, Object> result = new HashMap<>();
+        
+        if (!consumerService.isPaused()) {
+            result.put("success", false);
+            result.put("message", "Consumer is not paused");
+            return ResponseEntity.ok(result);
+        }
+        
+        consumerService.resume();
+        result.put("success", true);
+        result.put("message", "Consumer resumed");
+        
+        return ResponseEntity.ok(result);
+    }
+
+    @PostMapping("/clear-retry-count")
+    public ResponseEntity<Map<String, Object>> clearRetryCount() {
+        Map<String, Object> result = new HashMap<>();
+        
+        consumerService.clearRetryCountMap();
+        result.put("success", true);
+        result.put("message", "Retry count map cleared");
+        
+        return ResponseEntity.ok(result);
+    }
 }
