@@ -37,6 +37,9 @@ sync:
     max-interval-ms: 10000
     max-consecutive-failures: 10
     success-threshold: 0.2
+
+  dlq:
+    topic: data-sync-dlq
   vector:
     provider: local
     dimension: 384

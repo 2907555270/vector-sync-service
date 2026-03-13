@@ -9,6 +9,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.config.KafkaListenerEndpointRegistry;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.listener.MessageListenerContainer;
@@ -33,6 +34,12 @@ public class MessageConsumerService {
     private final ObjectMapper objectMapper;
     private final KafkaListenerEndpointRegistry listenerRegistry;
     private final KafkaTemplate<String, String> kafkaTemplate;
+
+    @Value("${spring.kafka.consumer.topic:data-sync-topic}")
+    private String mainTopic;
+
+    @Value("${sync.dlq.topic:data-sync-dlq}")
+    private String dlqTopic;
 
     @Getter
     private final AtomicBoolean paused = new AtomicBoolean(false);
@@ -66,7 +73,7 @@ public class MessageConsumerService {
         }
 
         if (records == null || records.isEmpty()) {
-            log.warn("Received batch of 0 messages, not processing records");
+            log.warn("Received records is empty, not processing records");
             acknowledgment.acknowledge();
             return;
         }
@@ -93,7 +100,7 @@ public class MessageConsumerService {
                     continue;
                 }
 
-                boolean success = processWithRetry(message, record);
+                boolean success = processWithRetry(message);
                 
                 if (success) {
                     successRecords.add(record);
@@ -115,7 +122,7 @@ public class MessageConsumerService {
         totalFailed.add(failedRecords.size());
 
         int processedCount = processedRecords.size();
-        double successRate = processedCount > 0 ? (double) successRecords.size() / records.size() : 0;
+        double successRate = processedCount > 0 ? (double) successRecords.size() / processedCount : 0;
         double threshold = syncProperties.getRetry().getSuccessThreshold();
 
         boolean shouldAck = !successRecords.isEmpty() && successRate >= threshold;
@@ -126,7 +133,7 @@ public class MessageConsumerService {
             if (!failedRecords.isEmpty()) {
                 log.warn("Batch acknowledged with failures. Success: {}, Failed: {}, Rate: {}", 
                     successRecords.size(), failedRecords.size(), successRate);
-                sendFailedToQueue(failedRecords);
+                sendFailedToQueueOrDlq(failedRecords);
             } else {
                 consecutiveBatchFailures.set(0);
                 log.info("Batch all success, acknowledged {} records", processedCount);
@@ -146,19 +153,24 @@ public class MessageConsumerService {
         lastFlushTime.set(System.currentTimeMillis());
     }
 
-    private String getMessageKey(ConsumerRecord<String, String> record) {
-        return record.topic() + "-" + record.partition() + "-" + record.offset();
+    private String getMessageKey(SyncMessage message) {
+        return message.getMessageKey();
     }
 
-    private void sendFailedToQueue(List<ConsumerRecord<String, String>> failedRecords) {
+    private void sendFailedToQueueOrDlq(List<ConsumerRecord<String, String>> failedRecords) {
         for (ConsumerRecord<String, String> record : failedRecords) {
             try {
-                String messageKey = getMessageKey(record);
+                SyncMessage message = objectMapper.readValue(record.value(), SyncMessage.class);
+                if (message == null) continue;
+                
+                String messageKey = getMessageKey(message);
                 int currentRetryCount = retryCountMap.getOrDefault(messageKey, 0);
                 
                 if (currentRetryCount >= syncProperties.getRetry().getMaxAttempts()) {
-                    log.warn("Message {} exceeded max retries ({}), discarding", 
+                    log.warn("Message {} exceeded max retries ({}), sending to DLQ", 
                         messageKey, syncProperties.getRetry().getMaxAttempts());
+                    
+                    sendToDlq(message, record.value(), "Max retries exceeded: " + currentRetryCount);
                     totalDlq.increment();
                     retryCountMap.remove(messageKey);
                 } else {
@@ -178,12 +190,37 @@ public class MessageConsumerService {
                         messageKey, currentRetryCount + 1, syncProperties.getRetry().getMaxAttempts());
                 }
             } catch (Exception e) {
-                log.error("Failed to send message back to queue: {}", e.getMessage());
+                log.error("Failed to send message: {}", e.getMessage());
             }
         }
     }
 
-    private boolean processWithRetry(SyncMessage message, ConsumerRecord<String, String> record) {
+    private void sendToDlq(SyncMessage message, String originalValue, String reason) {
+        try {
+            Map<String, Object> dlqData = new HashMap<>();
+            dlqData.put("original_message", message);
+            dlqData.put("original_value", originalValue);
+            dlqData.put("dlq_reason", reason);
+            dlqData.put("dlq_timestamp", System.currentTimeMillis());
+            dlqData.put("message_key", getMessageKey(message));
+            
+            String dlqValue = objectMapper.writeValueAsString(dlqData);
+            
+            ProducerRecord<String, String> dlqRecord = new ProducerRecord<>(
+                dlqTopic,
+                message.getId(),
+                dlqValue
+            );
+            
+            kafkaTemplate.send(dlqRecord);
+            log.info("Message sent to DLQ: key={}, reason={}", getMessageKey(message), reason);
+            
+        } catch (Exception e) {
+            log.error("Failed to send to DLQ: {}", e.getMessage());
+        }
+    }
+
+    private boolean processWithRetry(SyncMessage message) {
         int maxRetries = syncProperties.getRetry().getMaxAttempts();
         long initialDelay = syncProperties.getRetry().getInitialIntervalMs();
         double multiplier = syncProperties.getRetry().getMultiplier();
@@ -196,7 +233,7 @@ public class MessageConsumerService {
             try {
                 elasticsearchService.bulkIndex(List.of(message));
                 
-                String messageKey = getMessageKey(record);
+                String messageKey = getMessageKey(message);
                 retryCountMap.remove(messageKey);
                 
                 return true;
@@ -272,6 +309,7 @@ public class MessageConsumerService {
                 .consecutiveBatchFailures(consecutiveBatchFailures.get())
                 .successThreshold(syncProperties.getRetry().getSuccessThreshold())
                 .retryCountMapSize(retryCountMap.size())
+                .dlqTopic(dlqTopic)
                 .lastFlushTime(lastFlushTime.get())
                 .build();
     }
@@ -288,6 +326,7 @@ public class MessageConsumerService {
         private int consecutiveBatchFailures;
         private double successThreshold;
         private int retryCountMapSize;
+        private String dlqTopic;
         private long lastFlushTime;
     }
 }
