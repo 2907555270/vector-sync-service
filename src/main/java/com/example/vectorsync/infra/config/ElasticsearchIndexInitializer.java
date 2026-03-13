@@ -1,6 +1,7 @@
 package com.example.vectorsync.infra.config;
 
 import co.elastic.clients.elasticsearch.ElasticsearchClient;
+import co.elastic.clients.elasticsearch._types.mapping.DenseVectorSimilarity;
 import co.elastic.clients.elasticsearch.indices.CreateIndexRequest;
 import co.elastic.clients.elasticsearch.indices.ExistsRequest;
 import co.elastic.clients.elasticsearch.indices.GetIndexRequest;
@@ -50,8 +51,10 @@ public class ElasticsearchIndexInitializer implements ApplicationRunner {
                         .properties("dense_vector", p -> p.denseVector(dv -> dv
                                 .dims(vectorDimension)
                                 .index(true)
-                                .similarity(co.elastic.clients.elasticsearch._types.Similarity.Cosine)))
-                        .properties("sparse_vector", p -> p.sparseVector(sv -> sv)))
+                                .similarity(DenseVectorSimilarity.Cosine)))
+                        // 改为 sparse_vector 类型（无额外参数即可）
+                        .properties("sparse_vector", p -> p.sparseVector(sv -> sv))
+                )
                 .settings(s -> s
                         .numberOfShards("1")
                         .numberOfReplicas("1"))
@@ -64,23 +67,22 @@ public class ElasticsearchIndexInitializer implements ApplicationRunner {
         var response = esClient.indices()
                 .get(GetIndexRequest.of(g -> g.index(indexName)));
 
-        var indexMapping = response.get(indexName).mappings();
+        var indexMapping = response.result().get(indexName).mappings();  // 注意：用 result() 而非 get(indexName)
         if (indexMapping != null && indexMapping.properties() != null) {
             var properties = indexMapping.properties();
 
             if (!properties.containsKey("sparse_vector")) {
                 log.warn("Index {} is missing sparse_vector field. Consider reindexing.", indexName);
-            } else {
-                var sparseVectorField = properties.get("sparse_vector");
-                String actualType = sparseVectorField.isObject()
-                        ? sparseVectorField.asObject().asMap().get("type").toString()
-                        : "unknown";
-                log.info("sparse_vector field type: {}", actualType);
+                return;
+            }
 
-                if (!"sparse_vector".equals(actualType)) {
-                    log.error("sparse_vector field type is incorrect! Expected: sparse_vector, Actual: {}",
-                            actualType);
-                }
+            var sparseField = properties.get("sparse_vector");
+            if (sparseField.isSparseVector()) {
+                log.info("sparse_vector field type: sparse_vector (correct)");
+            } else if (sparseField.isRankFeatures()) {
+                log.warn("sparse_vector field type: rank_features (legacy, recommend upgrading to sparse_vector)");
+            } else {
+                log.error("sparse_vector field has unexpected type: {}", sparseField._kind());
             }
         }
     }
