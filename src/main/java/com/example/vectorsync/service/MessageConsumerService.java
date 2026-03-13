@@ -68,7 +68,8 @@ public class MessageConsumerService {
         log.info("Received batch of {} messages", records.size());
 
         Map<TopicPartition, OffsetAndMetadata> offsetsToCommit = new HashMap<>();
-        int batchFailedCount = 0;
+        List<ConsumerRecord<String, String>> failedRecords = new ArrayList<>();
+        int successCount = 0;
 
         for (ConsumerRecord<String, String> record : records) {
             if (paused.get()) {
@@ -82,6 +83,7 @@ public class MessageConsumerService {
                 if (message.getId() == null || message.getId().isEmpty()) {
                     log.warn("Message missing ID, skipping offset: {}", record.offset());
                     addOffsetToCommit(record, offsetsToCommit);
+                    successCount++;
                     continue;
                 }
 
@@ -89,36 +91,54 @@ public class MessageConsumerService {
                 
                 if (success) {
                     addOffsetToCommit(record, offsetsToCommit);
-                    totalSuccess.increment();
+                    successCount++;
                     retryService.clearRetryCount(message.getId());
                 } else {
-                    batchFailedCount++;
-                    handleFailedMessage(message, record.value());
+                    failedRecords.add(record);
                 }
 
             } catch (JsonProcessingException e) {
                 log.error("Failed to parse message at offset {}: {}", record.offset(), e.getMessage());
                 addOffsetToCommit(record, offsetsToCommit);
+                successCount++;
             } catch (Exception e) {
                 log.error("Failed to process message at offset {}: {}", record.offset(), e.getMessage());
-                batchFailedCount++;
+                failedRecords.add(record);
             }
         }
 
-        totalProcessed.add(records.size() - batchFailedCount);
+        totalProcessed.add(records.size());
+        
+        boolean allFailed = failedRecords.size() == records.size() && successCount == 0;
+        boolean hasSuccess = successCount > 0;
 
-        if (!offsetsToCommit.isEmpty()) {
+        if (hasSuccess) {
             acknowledgment.addOffsets(offsetsToCommit);
+            totalSuccess.add(successCount);
             log.info("Acknowledged {} records", offsetsToCommit.size());
         }
 
-        if (batchFailedCount > 0) {
-            int currentFailures = consecutiveFailures.addAndGet(batchFailedCount);
-            log.warn("Batch had {} failed records, consecutive failures: {}", batchFailedCount, currentFailures);
-
-            if (currentFailures >= syncProperties.getRetry().getMaxConsecutiveFailures()) {
-                log.error("Max consecutive failures reached, pausing consumer");
-                pause();
+        if (!failedRecords.isEmpty()) {
+            totalFailed.add(failedRecords.size());
+            
+            if (allFailed) {
+                // 全部失败：下游故障，暂停消费者，不发送重试队列
+                int currentFailures = consecutiveFailures.addAndGet(failedRecords.size());
+                log.error("ALL messages in batch failed ({}), likely downstream service is down. Consecutive failures: {}", 
+                    failedRecords.size(), currentFailures);
+                
+                if (currentFailures >= syncProperties.getRetry().getMaxConsecutiveFailures()) {
+                    pause();
+                }
+            } else {
+                // 部分失败：临时故障，发送到重试队列
+                consecutiveFailures.set(0);
+                log.warn("Partially failed ({} success, {} failed), sending failed to retry queue", 
+                    successCount, failedRecords.size());
+                
+                for (ConsumerRecord<String, String> failedRecord : failedRecords) {
+                    handleFailedMessage(failedRecord);
+                }
             }
         } else {
             consecutiveFailures.set(0);
@@ -127,23 +147,26 @@ public class MessageConsumerService {
         lastFlushTime.set(System.currentTimeMillis());
     }
 
-    private void handleFailedMessage(SyncMessage message, String originalValue) {
-        int currentRetryCount = retryService.getRetryCount(message.getId());
-        
-        if (currentRetryCount >= syncProperties.getRetry().getMaxAttempts()) {
-            log.error("Message {} exceeded max retries ({}) , sending to DLQ", 
-                message.getId(), syncProperties.getRetry().getMaxAttempts());
-            retryService.sendToDlq(message.getId(), originalValue, 
-                "Max retries exceeded", currentRetryCount);
-            totalDlq.increment();
-            retryService.clearRetryCount(message.getId());
-        } else {
-            retryService.incrementRetryCount(message.getId());
-            retryService.sendToRetry(message.getId(), originalValue, currentRetryCount);
-            totalRetried.increment();
+    private void handleFailedMessage(ConsumerRecord<String, String> record) {
+        try {
+            SyncMessage message = objectMapper.readValue(record.value(), SyncMessage.class);
+            int currentRetryCount = retryService.getRetryCount(message.getId());
+            
+            if (currentRetryCount >= syncProperties.getRetry().getMaxAttempts()) {
+                log.error("Message {} exceeded max retries ({}), sending to DLQ", 
+                    message.getId(), syncProperties.getRetry().getMaxAttempts());
+                retryService.sendToDlq(message.getId(), record.value(), 
+                    "Max retries exceeded", currentRetryCount);
+                totalDlq.increment();
+                retryService.clearRetryCount(message.getId());
+            } else {
+                retryService.incrementRetryCount(message.getId());
+                retryService.sendToRetry(message.getId(), record.value(), currentRetryCount);
+                totalRetried.increment();
+            }
+        } catch (Exception e) {
+            log.error("Failed to handle failed message: {}", e.getMessage());
         }
-        
-        totalFailed.increment();
     }
 
     private void addOffsetToCommit(ConsumerRecord<String, String> record, 
