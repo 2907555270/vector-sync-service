@@ -8,7 +8,7 @@ spring:
     consumer:
       group-id: vector-sync-group
       concurrency: 5
-      max-poll-records: 1
+      max-poll-records: 100
       auto-offset-reset: earliest
       enable-auto-commit: false
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
@@ -24,7 +24,7 @@ sync:
     topic: data-sync-topic
     consumer-group: vector-sync-group
   elasticsearch:
-    index: vectors
+    index: nl2sql_vectors
     bulk-size: 100
     flush-interval-seconds: 5
   batch:
@@ -47,7 +47,7 @@ sync:
 
 vector:
   api:
-    base-url: http://localhost:9003
+    base-url: http://localhost:8000
     timeout: 30000
     enabled: true
 

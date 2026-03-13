@@ -25,9 +25,9 @@ public class VectorTransformService {
         }
 
         String content = extractContent(message.getData());
-        List<Float> vector = generateVector(message.getData());
+        List<Float> denseVector = generateDenseVector(message.getData());
 
-        Map<String, Object> sparseVector = null;
+        Map<String, Float> sparseVector = null;
         if (vectorApiService != null && vectorApiService.isEnabled() && content != null && !content.isEmpty()) {
             try {
                 sparseVector = generateSparseVector(content);
@@ -36,7 +36,7 @@ public class VectorTransformService {
             }
         }
 
-        VectorDocument doc = VectorDocument.fromSyncMessage(message, vector, content);
+        VectorDocument doc = VectorDocument.fromSyncMessage(message, denseVector, content);
         doc.setSparseVector(sparseVector);
         
         return doc;
@@ -77,7 +77,7 @@ public class VectorTransformService {
         return content.toString().trim();
     }
 
-    private List<Float> generateVector(Map<String, Object> data) {
+    private List<Float> generateDenseVector(Map<String, Object> data) {
         String content = extractContent(data);
         return embedText(content);
     }
@@ -107,23 +107,17 @@ public class VectorTransformService {
         return vector;
     }
 
-    private Map<String, Object> generateSparseVector(String text) {
+    private Map<String, Float> generateSparseVector(String text) {
         if (text == null || text.isEmpty()) {
             return null;
         }
 
         try {
             VectorApiService.SparseVectorResult result = vectorApiService.generateSparseVector(text, false);
-            Map<String, Object> sparseMap = new HashMap<>();
-            
-            if (result.getSparseIdVector() != null) {
-                sparseMap.put("sparse_id_vector", result.getSparseIdVector());
+            if (result.getSparseIdVector() != null && !result.getSparseIdVector().isEmpty()) {
+                return result.getSparseIdVector();
             }
-            if (result.getSparseWordVector() != null) {
-                sparseMap.put("sparse_word_vector", result.getSparseWordVector());
-            }
-            
-            return sparseMap.isEmpty() ? null : sparseMap;
+            return null;
         } catch (Exception e) {
             log.warn("Failed to call sparse vector API: {}", e.getMessage());
             return null;
